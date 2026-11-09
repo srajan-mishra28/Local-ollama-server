@@ -1,0 +1,23 @@
+# Runtime data
+server.db
+server.db-journal
+server.db-wal
+server.db-shm
+uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local config
+.env
