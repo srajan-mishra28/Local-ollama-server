@@ -16,6 +16,7 @@ Then open http://<lan-ip>:8000
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -48,14 +49,28 @@ MAX_CONTEXT_BYTES = 120_000  # keep the prompt inside the model's window
 # storage
 # --------------------------------------------------------------------------
 
+@contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    """Commit on clean exit, always close.
+
+    sqlite3's own connection context manager commits but does NOT close, so
+    using it directly leaks a file handle per request.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
-    return conn
+    conn.execute("PRAGMA busy_timeout = 10000")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def init_db():
     with db() as c:
+        # WAL lets a reader run while a write is in flight, which matters once
+        # a phone and the laptop are both hitting this.
+        c.execute("PRAGMA journal_mode = WAL")
         c.executescript(
             """
             CREATE TABLE IF NOT EXISTS projects (
@@ -283,9 +298,10 @@ def safe_name(name: str) -> str:
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...), note: str = Form("")):
     dest = UPLOADS / safe_name(file.filename or "upload.bin")
+    stem, suffix = dest.stem, dest.suffix
     i = 1
     while dest.exists():
-        dest = UPLOADS / f"{dest.stem}_{i}{dest.suffix}"
+        dest = UPLOADS / f"{stem}_{i}{suffix}"
         i += 1
     with dest.open("wb") as out:
         while chunk := await file.read(1 << 20):
@@ -518,9 +534,10 @@ label.row{display:flex;gap:8px;align-items:center;font-size:13px;color:#c2c2ca}
 <dialog id="ctxDlg">
   <div class="dlg-h">Session context</div>
   <div class="dlg-b">
-    <select id="ctxProject" onchange="loadProjectFiles()"></select>
+    <select id="ctxProject" onchange="onProjectChange()"></select>
     <input id="ctxFilter" placeholder="Filter by path" oninput="loadProjectFiles()">
     <input id="ctxGrep" placeholder="Or search file contents, then press Enter">
+    <div class="muted" id="ctxCount"></div>
     <div id="ctxFiles" style="display:flex;flex-direction:column;gap:4px"></div>
   </div>
   <div class="dlg-f">
@@ -532,7 +549,7 @@ label.row{display:flex;gap:8px;align-items:center;font-size:13px;color:#c2c2ca}
 <script>
 const $ = (id) => document.getElementById(id);
 const log = $('log'), side = $('side');
-let sid = null, session = null, projects = [];
+let sid = null, session = null, projects = [], ctxSelected = new Set();
 
 const api = async (url, opts) => {
   const r = await fetch(url, opts);
@@ -717,8 +734,14 @@ async function openContext(){
     if (p.id === session.project_id) o.selected = true;
     sel.appendChild(o);
   });
+  ctxSelected = new Set(session.context || []);
   await loadProjectFiles();
   ctxDlg.showModal();
+}
+
+function onProjectChange(){
+  ctxSelected = new Set();   // paths belong to the old project, drop them
+  loadProjectFiles();
 }
 
 async function loadProjectFiles(){
@@ -743,23 +766,33 @@ $('ctxGrep').onkeydown = async (e) => {
 function paintFiles(files){
   const box = $('ctxFiles');
   box.innerHTML = '';
+  updateCtxCount();
   if (!files.length) { box.innerHTML = '<div class="muted">Nothing matched.</div>'; return; }
-  const chosen = new Set(session.context || []);
   files.slice(0, 400).forEach(f => {
     const l = document.createElement('label');
     l.className = 'row';
     const cb = document.createElement('input');
-    cb.type = 'checkbox'; cb.value = f; cb.checked = chosen.has(f);
+    cb.type = 'checkbox'; cb.value = f; cb.checked = ctxSelected.has(f);
     cb.style.flex = '0 0 auto';
+    // Track in a Set, not the DOM: filtering re-renders the list, and a file
+    // selected under an earlier filter must survive that.
+    cb.onchange = () => {
+      cb.checked ? ctxSelected.add(f) : ctxSelected.delete(f);
+      updateCtxCount();
+    };
     l.append(cb, document.createTextNode(f));
     box.appendChild(l);
   });
 }
 
+function updateCtxCount(){
+  const n = ctxSelected.size;
+  $('ctxCount').textContent = n ? `${n} file${n > 1 ? 's' : ''} selected` : 'No files selected';
+}
+
 async function saveContext(){
   const pid = $('ctxProject').value;
-  const files = [...$('ctxFiles').querySelectorAll('input:checked')].map(c => c.value);
-  await fetch('/api/sessions/' + sid, {method:'GET'});   // no-op, keeps flow simple
+  const files = [...ctxSelected];
   await api(`/api/sessions/${sid}/context`, {
     method:'PUT', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({files})
@@ -784,4 +817,4 @@ def set_project(sid: int, pid: str = ""):
     val = int(pid) if pid.strip() else None
     with db() as c:
         c.execute("UPDATE sessions SET project_id = ? WHERE id = ?", (val, sid))
-    return {"ok": True}
+    return {"ok": True}
