@@ -21,3 +21,5 @@ Thumbs.db
 
 # Local config
 .env
+rag.db
+project_files/

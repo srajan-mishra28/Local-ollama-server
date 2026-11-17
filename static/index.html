@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Local LLM</title>
+<script src="/static/theme.js"></script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div id="scrim" aria-hidden="true"></div>
+
+<aside id="side" aria-label="Sessions and tools">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">&#9670;</span>
+    <span>Local LLM</span>
+    <button class="icon" id="themeBtn" title="Toggle light/dark theme" aria-label="Toggle light/dark theme"></button>
+  </div>
+  <button class="primary wide" id="newBtn">+ New chat</button>
+  <nav class="list" id="sessions" aria-label="Sessions"></nav>
+  <div class="side-f">
+    <button class="ghost" id="projBtn">Projects</button>
+    <button class="ghost" id="filesBtn">Files</button>
+  </div>
+</aside>
+
+<main>
+  <header>
+    <button class="icon" id="menuBtn" aria-label="Open sessions" aria-controls="side">&#9776;</button>
+    <div class="head-t">
+      <div class="title" id="title">No session</div>
+      <div class="sub" id="sub"></div>
+    </div>
+    <button class="ghost" id="ctxBtn">Context</button>
+  </header>
+  <div class="chips" id="chips" aria-label="Pinned files"></div>
+
+  <div id="log" role="log" aria-live="polite" aria-label="Conversation">
+    <div class="empty" id="empty">
+      <div class="logo big" aria-hidden="true">&#9670;</div>
+      <h2>Ask your local model</h2>
+      <p>Chats stay on this machine. Pick a project under <b>Context</b> to ground answers in your files, PDFs and images.</p>
+    </div>
+  </div>
+
+  <form class="ask" id="ask">
+    <label for="q" class="sr">Message</label>
+    <textarea id="q" rows="1" placeholder="Ask something..." autocomplete="off" enterkeyhint="send"></textarea>
+    <button class="primary" id="send" aria-label="Send">Send</button>
+  </form>
+</main>
+
+<!-- file transfer -->
+<dialog id="filesDlg" aria-labelledby="filesH">
+  <div class="dlg-h" id="filesH">File transfer</div>
+  <div class="dlg-b">
+    <label class="drop" for="upInput">Choose files to send to the laptop<input type="file" id="upInput" multiple></label>
+    <div class="muted">Uploads land in ./uploads on the laptop.</div>
+    <div class="stack" id="fileList"></div>
+  </div>
+  <div class="dlg-f"><button class="ghost" data-close>Close</button></div>
+</dialog>
+
+<!-- projects -->
+<dialog id="projDlg" aria-labelledby="projH">
+  <div class="dlg-h" id="projH">Projects</div>
+  <div class="dlg-b">
+    <div class="stack" id="projList"></div>
+    <div class="muted">Add a folder on the laptop, e.g. C:\work\project-x</div>
+    <label class="sr" for="projName">Project name</label>
+    <input id="projName" placeholder="Name">
+    <label class="sr" for="projPath">Folder path</label>
+    <input id="projPath" placeholder="Absolute path">
+    <button class="primary" id="addProj">Add project</button>
+  </div>
+  <div class="dlg-f"><button class="ghost" data-close>Close</button></div>
+</dialog>
+
+<!-- project index -->
+<dialog id="idxDlg" aria-labelledby="idxH">
+  <div class="dlg-h" id="idxH">Project index</div>
+  <div class="dlg-b">
+    <div class="row-actions">
+      <button class="primary" id="indexBtn">Index project</button>
+      <label class="btn ghost" for="projUpload">Add files<input type="file" id="projUpload" multiple
+        accept=".pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp,text/*,.md,.py,.js,.ts,.java,.json,.yaml,.yml,.xml,.sql,.html,.css,.toml,.sh"></label>
+    </div>
+    <div class="muted">Indexes text files, PDFs (text layer) and images (described by a vision model). Unchanged files are skipped.</div>
+    <div id="idxResult" class="result" hidden></div>
+    <div class="stack" id="idxFiles"></div>
+  </div>
+  <div class="dlg-f"><button class="ghost" data-close>Close</button></div>
+</dialog>
+
+<!-- context -->
+<dialog id="ctxDlg" aria-labelledby="ctxH">
+  <div class="dlg-h" id="ctxH">Session context</div>
+  <div class="dlg-b">
+    <label class="sr" for="ctxProject">Project</label>
+    <select id="ctxProject"></select>
+    <label class="sr" for="ctxFilter">Filter by path</label>
+    <input id="ctxFilter" placeholder="Filter by path">
+    <label class="sr" for="ctxGrep">Search contents</label>
+    <input id="ctxGrep" placeholder="Or search file contents, then press Enter">
+    <div class="muted" id="ctxCount" aria-live="polite"></div>
+    <div class="stack tight" id="ctxFiles"></div>
+  </div>
+  <div class="dlg-f">
+    <button class="ghost" data-close>Cancel</button>
+    <button class="primary" id="saveCtx">Save</button>
+  </div>
+</dialog>
+
+<div id="toasts" aria-live="assertive"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
