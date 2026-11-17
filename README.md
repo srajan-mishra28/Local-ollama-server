@@ -1,4 +1,6 @@
 # Local Ollama Server
+<img width="1917" height="955" alt="image" src="https://github.com/user-attachments/assets/eb25aa07-cc10-47ba-86b9-f54a821b9fff" />
+
 
 A FastAPI gateway in front of a locally running [Ollama](https://ollama.com)
 model. It adds the things the raw Ollama API does not give you: persistent chat
