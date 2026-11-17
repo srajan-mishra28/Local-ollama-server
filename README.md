@@ -58,7 +58,9 @@ older turns contained should live in the files.
   generated, and the full reply is persisted once the stream completes.
 - **Modern, mobile-friendly UI.** Served from `/`, no build step, no CDN (works
   offline on a LAN). Light and dark themes (follows the system, with a manual
-  toggle that is remembered), markdown rendering with copyable code blocks,
+  toggle that is remembered; light = warm beige with Claude-terracotta accents,
+  dark = near-black, tokens in `static/style.css`; Netflix Sans is not bundled, so
+  dark mode uses a Helvetica-style fallback unless it is installed), markdown rendering with copyable code blocks,
   auto-growing input (Enter sends, Shift+Enter adds a line), toasts for errors
   such as Ollama being down, and a drawer sidebar on small screens.
 
