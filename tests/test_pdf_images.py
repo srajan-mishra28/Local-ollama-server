@@ -115,14 +115,6 @@ def test_pdf_size_cap(tmp_path):
     assert s.max_bytes("a.png") == rag.MAX_IMAGE_BYTES
 
 
-def test_scan_sync_checks_size_before_reading(tmp_path):
-    s = make_store(tmp_path, max_pdf_bytes=100)
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "big.pdf").write_bytes(make_pdf(["hello"]))
-    assert s.sync_file(1, root, "big.pdf") == "skipped"
-
-
 # ---- images ----------------------------------------------------------------
 
 def test_image_caption_indexed_with_header(store):
@@ -141,32 +133,9 @@ def test_captioner_failure_skips_without_recording(tmp_path):
     assert s.put_file(1, "a.png", PNG) == "captioned"
 
 
-def test_captioner_failure_does_not_abort_index_run(tmp_path):
-    cap = FakeCaptioner(fail=rag.CaptionError("nope"))
-    s = make_store(tmp_path, cap)
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "a.png").write_bytes(PNG)
-    (root / "b.py").write_text("print('hi')\n")
-    stats = s.index_project(1, root, ["a.png", "b.py"])
-    assert stats["skipped_image_failed"] == 1 and stats["skipped"] == 1
-    assert stats["indexed"] == 1 and "aborted" not in stats
-
-
-def test_captioner_connection_error_aborts(tmp_path):
-    s = make_store(tmp_path, FakeCaptioner(fail=httpx.ConnectError("down")))
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "a.png").write_bytes(PNG)
-    (root / "b.py").write_text("x = 1\n")
-    stats = s.index_project(1, root, ["a.png", "b.py"])
-    assert "aborted" in stats and stats["failed"] == 1 and stats["indexed"] == 0
-
-
 def test_vision_disabled(tmp_path):
     s = make_store(tmp_path, captioner=None, vision_model="")
-    assert not s.scannable("a.png") and s.scannable("a.pdf") and s.scannable("a.py")
-    assert s.put_file(1, "a.png", PNG, "upload") == "skipped_image_disabled"
+    assert s.put_file(1, "a.png", PNG) == "skipped_image_disabled"
     assert s.list_files(1) == []
 
 
@@ -184,18 +153,6 @@ def test_image_size_cap(tmp_path):
     s = make_store(tmp_path, cap, max_image_bytes=10)
     assert s.put_file(1, "a.png", PNG) == "skipped"
     assert cap.calls == 0
-
-
-def test_stats_report_new_outcomes(tmp_path):
-    s = make_store(tmp_path, FakeCaptioner())
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "a.png").write_bytes(PNG)
-    (root / "scan.pdf").write_bytes(make_pdf([""]))
-    (root / "ok.pdf").write_bytes(make_pdf(["hello"]))
-    stats = s.index_project(1, root, ["a.png", "scan.pdf", "ok.pdf"])
-    assert stats["captioned"] == 1 and stats["skipped_pdf_no_text"] == 1
-    assert stats["indexed"] == 2 and stats["skipped"] == 1
 
 
 def test_ollama_captioner_errors(monkeypatch):
@@ -235,67 +192,48 @@ def client(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def pid(client, tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "notes.md").write_text("plain notes")
-    (root / "manual.pdf").write_bytes(make_pdf(["install the flux capacitor"]))
-    (root / "shot.png").write_bytes(PNG)
-    return client.post("/api/projects", json={"name": "p", "path": str(root)}).json()["id"]
+def pid(client):
+    return client.post("/api/projects", json={"name": "p"}).json()["id"]
 
 
-def test_scan_picks_up_pdf_and_png(client, pid):
-    stats = client.post(f"/api/projects/{pid}/index").json()
-    assert stats["indexed"] == 3 and stats["captioned"] == 1
-    paths = {f["path"] for f in client.get(f"/api/projects/{pid}/index").json()}
-    assert paths == {"notes.md", "manual.pdf", "shot.png"}
+def upload(client, pid, name, data):
+    """Upload one file; returns its entry of the per-file results."""
+    r = client.post(f"/api/projects/{pid}/files", files={"files": (name, data)})
+    assert r.status_code == 200
+    return r.json()["results"][0]
+
+
+def test_upload_indexes_text_pdf_and_png(client, pid):
+    assert upload(client, pid, "notes.md", b"plain notes") == {"path": "notes.md", "result": "indexed"}
+    assert upload(client, pid, "manual.pdf", make_pdf(["install the flux capacitor"]))["result"] == "indexed"
+    assert upload(client, pid, "shot.png", PNG) == {"path": "shot.png", "result": "captioned"}
+    files = client.get(f"/api/projects/{pid}/files").json()
+    assert {f["path"] for f in files} == {"notes.md", "manual.pdf", "shot.png"}
+    assert all(f["chunks"] >= 1 for f in files)
     hits = client.get(f"/api/projects/{pid}/rag", params={"q": "flux capacitor"}).json()
     assert hits[0]["path"] == "manual.pdf" and hits[0]["text"].startswith("[page 1]")
 
 
-def test_pinnable_file_list_is_text_only(client, pid):
-    assert client.get(f"/api/projects/{pid}/files").json() == ["notes.md"]
-
-
-def test_upload_pdf_and_png(client, pid):
-    r = client.post(f"/api/projects/{pid}/upload", files={"file": ("a.pdf", make_pdf(["hello pdf"]))})
-    assert r.json() == {"path": "a.pdf", "result": "indexed"}
-    r = client.post(f"/api/projects/{pid}/upload", files={"file": ("b.png", PNG)})
-    assert r.json() == {"path": "b.png", "result": "captioned"}
-    r = client.post(f"/api/projects/{pid}/upload", files={"file": ("s.pdf", make_pdf([""]))})
-    assert r.json()["result"] == "skipped_pdf_no_text"
+def test_upload_pdf_without_text_is_skipped(client, pid):
+    assert upload(client, pid, "s.pdf", make_pdf([""]))["result"] == "skipped_pdf_no_text"
 
 
 def test_upload_caps_are_per_type(client, pid, monkeypatch):
     monkeypatch.setattr(rag_store.store, "max_pdf_bytes", 50)
-    r = client.post(f"/api/projects/{pid}/upload", files={"file": ("a.pdf", make_pdf(["hello"]))})
-    assert r.status_code == 413
+    assert upload(client, pid, "a.pdf", make_pdf(["hello"]))["status"] == 413
     big = b"a " * (rag.MAX_FILE_BYTES // 2 + 10)  # over the text cap
-    assert client.post(f"/api/projects/{pid}/upload", files={"file": ("a.txt", big)}).status_code == 413
+    assert upload(client, pid, "a.txt", big)["status"] == 413
     # a PDF may exceed the 1 MB text cap
     monkeypatch.setattr(rag_store.store, "max_pdf_bytes", rag.MAX_PDF_BYTES)
     pdf = make_pdf(["hello"]) + b"\n%" + b"x" * (rag.MAX_FILE_BYTES + 10)
-    assert client.post(f"/api/projects/{pid}/upload", files={"file": ("big.pdf", pdf)}).status_code == 200
-
-
-def test_pinned_context_never_injects_binary(client, pid):
-    from backend.routes.chat import build_context_block
-    assert build_context_block(pid, ["manual.pdf", "shot.png"]) == ""
-    assert "plain notes" in build_context_block(pid, ["manual.pdf", "notes.md"])
+    assert upload(client, pid, "big.pdf", pdf)["result"] == "indexed"
 
 
 def test_vision_disabled_keeps_existing_captions(tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "a.png").write_bytes(PNG)
-    (root / "b.py").write_text("x = 1\n")
     on = make_store(tmp_path, FakeCaptioner())
-    on.index_project(1, root, ["a.png", "b.py"])
+    on.put_file(1, "a.png", PNG)
     off = make_store(tmp_path, captioner=None, vision_model="")
-    stats = off.index_project(1, root, ["b.py"])  # images are no longer scanned
-    assert stats["deleted"] == 0
-    assert off.sync_file(1, root, "a.png") == "missing"
-    assert {f["path"] for f in off.list_files(1)} == {"a.png", "b.py"}
+    assert {f["path"] for f in off.list_files(1)} == {"a.png"}
     assert "ACME" in off.query(1, "acme logo", 1)[0]["text"]
 
 

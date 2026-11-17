@@ -24,64 +24,71 @@ def client(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def project(client, tmp_path):
-    root = tmp_path / "proj"
-    (root / "node_modules").mkdir(parents=True)
-    (root / "a.py").write_text("def alpha():\n    return 'banana smoothie'\n")
-    (root / "node_modules" / "x.js").write_text("ignored")
-    pid = client.post("/api/projects", json={"name": "p", "path": str(root)}).json()["id"]
-    return pid, root
+def project(client):
+    """A project workspace holding two uploaded files, a.py and b.py."""
+    pid = client.post("/api/projects", json={"name": "p"}).json()["id"]
+    r = client.post(f"/api/projects/{pid}/files", files=[
+        ("files", ("a.py", b"def alpha():\n    return 'banana smoothie'\n")),
+        ("files", ("b.py", b"def beta():\n    return 'quantum entanglement'\n")),
+    ])
+    assert [x["result"] for x in r.json()["results"]] == ["indexed", "indexed"]
+    return pid
 
 
-def test_index_query_update_delete(client, project):
-    pid, root = project
-    assert client.post(f"/api/projects/{pid}/index").json()["indexed"] == 1
+def test_upload_query_replace_delete(client, project):
+    pid = project
     hits = client.get(f"/api/projects/{pid}/rag", params={"q": "banana"}).json()
     assert hits[0]["path"] == "a.py"
 
-    (root / "a.py").write_text("def alpha():\n    return 'cherry'\n")
-    assert client.post(f"/api/projects/{pid}/index/file", params={"path": "a.py"}).json() == {"result": "indexed"}
+    r = client.post(f"/api/projects/{pid}/files", files={"files": ("a.py", b"def alpha():\n    return 'cherry'\n")})
+    assert r.json()["results"] == [{"path": "a.py", "result": "indexed"}]
+    assert all("banana" not in h["text"] for h in client.get(f"/api/projects/{pid}/rag", params={"q": "banana"}).json())
 
-    (root / "a.py").unlink()
-    assert client.post(f"/api/projects/{pid}/index").json()["deleted"] == 1
-    assert client.get(f"/api/projects/{pid}/index").json() == []
-
-
-def test_unindex_file_and_bad_path(client, project):
-    pid, _ = project
-    client.post(f"/api/projects/{pid}/index")
-    assert client.delete(f"/api/projects/{pid}/index/file", params={"path": "a.py"}).json() == {"deleted": True}
-    assert client.delete(f"/api/projects/{pid}/index/file", params={"path": "../x"}).status_code == 400
+    assert client.delete(f"/api/projects/{pid}/files", params={"path": "a.py"}).json() == {"deleted": True}
+    assert [f["path"] for f in client.get(f"/api/projects/{pid}/files").json()] == ["b.py"]
 
 
-def test_upload_to_project(client, project):
-    pid, _ = project
-    r = client.post(f"/api/projects/{pid}/upload", files={"file": ("n.md", b"remember the milk")})
-    assert r.json() == {"path": "n.md", "result": "indexed"}
-    assert client.get(f"/api/projects/{pid}/rag", params={"q": "milk"}).json()[0]["path"] == "n.md"
-    r = client.post(f"/api/projects/{pid}/upload", files={"file": ("b.bin", b"\x00\x01")})
-    assert r.json()["result"] == "skipped"
+def test_delete_file_and_bad_path(client, project):
+    pid = project
+    assert client.delete(f"/api/projects/{pid}/files", params={"path": "zzz"}).json() == {"deleted": False}
+    assert client.delete(f"/api/projects/{pid}/files", params={"path": "../x"}).status_code == 400
+
+
+def test_upload_binary_is_skipped(client, project):
+    r = client.post(f"/api/projects/{project}/files", files={"files": ("b.bin", b"\x00\x01")})
+    assert r.json()["results"] == [{"path": "b.bin", "result": "skipped"}]
 
 
 def test_unknown_project_404(client):
-    assert client.post("/api/projects/99/index").status_code == 404
+    assert client.post("/api/projects/99/files", files={"files": ("a.md", b"x")}).status_code == 404
+    assert client.get("/api/projects/99/files").status_code == 404
+    assert client.get("/api/projects/99").status_code == 404
 
 
-def test_embedding_failure_is_502(client, project, monkeypatch):
-    pid, _ = project
+def test_embedding_failure_is_a_502_entry_and_does_not_stop_the_batch(client, project, monkeypatch):
+    calls = []
 
-    def boom(texts):
-        raise httpx.ConnectError("down")
+    def flaky(texts):
+        calls.append(texts)
+        if len(calls) == 1:
+            raise httpx.ConnectError("down")
+        return fake_embedder(texts)
 
-    monkeypatch.setattr(rag_store.store, "embedder", boom)
-    assert client.post(f"/api/projects/{pid}/upload", files={"file": ("n.md", b"x y")}).status_code == 502
+    monkeypatch.setattr(rag_store.store, "embedder", flaky)
+    r = client.post(f"/api/projects/{project}/files", files=[
+        ("files", ("n.md", b"x y")), ("files", ("m.md", b"p q")),
+    ])
+    assert r.status_code == 200
+    first, second = r.json()["results"]
+    assert first["result"] == "error" and first["status"] == 502 and "Ollama" in first["detail"]
+    assert second == {"path": "m.md", "result": "indexed"}
 
 
 @pytest.mark.anyio
 async def test_retrieve_context(client, project, monkeypatch):
-    pid, _ = project
-    assert await server.retrieve_context(pid, "banana") == ""  # nothing indexed yet
-    client.post(f"/api/projects/{pid}/index")
+    pid = project
+    empty = client.post("/api/projects", json={"name": "empty"}).json()["id"]
+    assert await server.retrieve_context(empty, "banana") == ""  # nothing indexed yet
     assert "banana" in await server.retrieve_context(pid, "banana")
     assert await server.retrieve_context(None, "banana") == ""
 

@@ -74,70 +74,10 @@ def store(tmp_path):
     return rag.RagStore(tmp_path / "r.db", tmp_path / "copies", fake_embedder, model="m")
 
 
-def test_shadowed_scan_does_not_embed_or_touch_copy(tmp_path):
-    calls = []
-
-    def emb(texts):
-        calls.append(texts)
-        return fake_embedder(texts)
-
-    s = rag.RagStore(tmp_path / "r.db", tmp_path / "copies", emb, model="m")
-    assert s.put_file(1, "n.md", b"uploaded", "upload") == "indexed"
-    n = len(calls)
-    assert s.put_file(1, "n.md", b"scanned", "scan") == "shadowed"
-    assert len(calls) == n
-    assert (tmp_path / "copies" / "1" / "n.md").read_bytes() == b"uploaded"
-
-
-def test_scan_prune_never_removes_upload(store, tmp_path):
-    store.put_file(1, "u.md", b"mine", "upload")
-    stats = store.index_project(1, tmp_path, [], prune=True)
-    assert stats["deleted"] == 0
-    assert store.has_index(1)
-
-
-def test_sync_file_missing_upload_is_kept(store, tmp_path):
-    store.put_file(1, "u.md", b"mine", "upload")
-    assert store.sync_file(1, tmp_path, "u.md") == "missing"
-    assert store.list_files(1)[0]["source"] == "upload"
-
-
 def test_upload_can_be_deleted_explicitly(store):
-    store.put_file(1, "u.md", b"mine", "upload")
+    store.put_file(1, "u.md", b"mine")
     assert store.delete_file(1, "u.md") is True
     assert not (store.files_dir / "1" / "u.md").exists()
-
-
-def test_abort_does_not_prune_even_with_prune_true(tmp_path):
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "a.py").write_text("x = 1\n")
-    (root / "b.py").write_text("y = 2\n")
-    ok = rag.RagStore(tmp_path / "r.db", tmp_path / "c", fake_embedder, model="m")
-    ok.index_project(1, root, ["a.py", "b.py"])
-
-    def down(texts):
-        raise httpx.ConnectError("down")
-
-    s = rag.RagStore(tmp_path / "r.db", tmp_path / "c", down, model="m2")
-    stats = s.index_project(1, root, ["a.py", "b.py"], prune=True)
-    assert "aborted" in stats and stats["failed"] == 1
-    assert {f["path"] for f in s.list_files(1)} == {"a.py", "b.py"}
-
-
-def test_http_status_error_does_not_abort(tmp_path):
-    root = tmp_path / "root"
-    root.mkdir()
-    (root / "a.py").write_text("x = 1\n")
-    (root / "b.py").write_text("y = 2\n")
-
-    def bad(texts):
-        raise httpx.HTTPStatusError("500", request=httpx.Request("POST", "http://x"),
-                                    response=httpx.Response(500))
-
-    s = rag.RagStore(tmp_path / "r.db", tmp_path / "c", bad, model="m")
-    stats = s.index_project(1, root, ["a.py", "b.py"])
-    assert stats["failed"] == 2 and "aborted" not in stats
 
 
 def test_query_blank_does_not_raise_reindex_on_stale_index(tmp_path):

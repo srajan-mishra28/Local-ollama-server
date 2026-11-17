@@ -231,75 +231,6 @@ def test_failed_reembed_does_not_update_signature(tmp_path):
     assert s.query(1, "v2")[0]["text"] == "v2"
 
 
-def test_index_project_counts_embed_failure_and_keeps_old(tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "a.py").write_text("alpha original")
-    state = {"fail": False}
-
-    def emb(texts):
-        if state["fail"]:
-            raise httpx.ConnectError("down")
-        return fake_embedder(texts)
-
-    s = rag.RagStore(tmp_path / "r.db", tmp_path / "c", emb, model="m")
-    s.index_project(1, root, ["a.py"])
-    (root / "a.py").write_text("alpha changed")
-    state["fail"] = True
-    stats = s.index_project(1, root, ["a.py"])
-    assert stats["failed"] == 1 and stats["deleted"] == 0
-    state["fail"] = False
-    assert s.query(1, "alpha")[0]["text"] == "alpha original"
-    assert [f["path"] for f in s.list_files(1)] == ["a.py"]
-
-
-def test_index_project_invalid_path_counted_failed(store, tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    stats = store.index_project(1, root, ["../x.py"])
-    assert stats["failed"] == 1
-
-
-def test_index_project_model_change_reindexes_all(tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "a.py").write_text("alpha")
-    a = rag.RagStore(tmp_path / "r.db", tmp_path / "c", fake_embedder, model="m1")
-    a.index_project(1, root, ["a.py"])
-    b = rag.RagStore(tmp_path / "r.db", tmp_path / "c", fake_embedder, model="m2")
-    assert b.index_project(1, root, ["a.py"])["indexed"] == 1
-    assert b.index_project(1, root, ["a.py"])["unchanged"] == 1
-
-
-def test_index_project_empty_file_skipped(store, tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "empty.py").write_text("")
-    assert store.index_project(1, root, ["empty.py"])["skipped"] == 1
-    assert store.list_files(1)[0]["chunks"] == 0
-
-
-def test_index_project_does_not_delete_other_projects(store, tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "a.py").write_text("alpha")
-    store.index_project(1, root, ["a.py"])
-    store.index_project(2, root, [])
-    assert store.has_index(1)
-
-
-def test_sync_file_outside_root_via_symlink_or_missing(store, tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    assert store.sync_file(1, root, "nope.py") == "missing"
-
-
-def test_sync_file_directory_is_missing(store, tmp_path):
-    root = tmp_path / "proj"
-    (root / "d").mkdir(parents=True)
-    assert store.sync_file(1, root, "d") == "missing"
-
-
 def test_delete_file_rejects_traversal(store):
     with pytest.raises(ValueError):
         store.delete_file(1, "../x")
@@ -316,30 +247,6 @@ def test_delete_project_leaves_other_projects(store):
 
 def test_delete_project_unknown_is_noop(store):
     store.delete_project(999)
-
-
-def test_scan_does_not_clobber_upload_at_same_path(store, tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "n.md").write_text("from disk")
-    store.put_file(1, "n.md", b"uploaded", source="upload")
-    assert store.sync_file(1, root, "n.md") == "shadowed"
-    assert store.index_project(1, root, ["n.md"])["shadowed"] == 1
-    assert store.list_files(1)[0]["source"] == "upload"
-    assert store.query(1, "uploaded")[0]["text"] == "uploaded"
-    assert (store.files_dir / "1" / "n.md").read_bytes() == b"uploaded"
-
-
-def test_upload_replaces_scanned_file_and_takes_over(store, tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "n.md").write_text("from disk")
-    store.sync_file(1, root, "n.md")
-    store.put_file(1, "n.md", b"uploaded", source="upload")
-    assert store.list_files(1)[0]["source"] == "upload"
-    (root / "n.md").unlink()
-    assert store.index_project(1, root, [])["deleted"] == 0  # no longer swept as a scan file
-    assert store.has_index(1)
 
 
 def test_list_files_includes_zero_chunk_files_sorted(store):
@@ -400,24 +307,6 @@ def test_delete_file_only_unlinks_known_copies(store):
 
 
 # ---- sync_file filters -----------------------------------------------------
-
-@pytest.mark.parametrize("rel", [".env", ".git/config", "id_rsa", "node_modules/x.js", "notes.txt"])
-def test_sync_file_applies_scan_filters(store, tmp_path, rel):
-    root = tmp_path / "proj"
-    (root / rel).parent.mkdir(parents=True, exist_ok=True)
-    (root / rel).write_text("SECRET=1")
-    assert store.sync_file(1, root, rel) == "missing"
-    assert not store.has_index(1)
-
-
-def test_sync_file_refuses_symlink_escaping_root(store, tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    (tmp_path / "secret.py").write_text("password = 1")
-    _symlink_or_skip(root / "leak.py", tmp_path / "secret.py")
-    assert store.sync_file(1, root, "leak.py") == "missing"
-    assert not store.has_index(1)
-
 
 # ---- copy / index consistency ----------------------------------------------
 
@@ -499,33 +388,6 @@ def test_query_uses_query_embedder_when_given(tmp_path):
 
 
 # ---- index_project: cap and fail-fast --------------------------------------
-
-def test_index_project_prune_false_keeps_unlisted_files(store, tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    (root / "a.py").write_text("alpha")
-    (root / "b.py").write_text("beta")
-    store.index_project(1, root, ["a.py", "b.py"])
-    assert store.index_project(1, root, ["a.py"], prune=False)["deleted"] == 0
-    assert {f["path"] for f in store.list_files(1)} == {"a.py", "b.py"}
-
-
-def test_index_project_aborts_on_first_connection_error(tmp_path):
-    root = tmp_path / "proj"
-    root.mkdir()
-    for n in "abc":
-        (root / f"{n}.py").write_text(n)
-    calls = []
-
-    def down(texts):
-        calls.append(texts)
-        raise httpx.ConnectError("down")
-
-    s = rag.RagStore(tmp_path / "r.db", tmp_path / "c", down, model="m")
-    stats = s.index_project(1, root, ["a.py", "b.py", "c.py"])
-    assert len(calls) == 1 and "aborted" in stats and stats["failed"] == 1
-    assert stats["deleted"] == 0
-
 
 # ---- embedder response handling --------------------------------------------
 

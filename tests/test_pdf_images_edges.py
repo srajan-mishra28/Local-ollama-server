@@ -14,9 +14,6 @@ import rag  # noqa: E402
 from backend import database, rag_store  # noqa: E402
 from test_pdf_images import PNG, FakeCaptioner, make_pdf, make_store  # noqa: E402
 
-ORIGINAL_KEYS = {"indexed", "unchanged", "skipped", "shadowed", "deleted", "missing", "failed"}
-
-
 def texts(store, pid=1, q="x", k=50):
     return [h["text"] for h in store.query(pid, q, k)]
 
@@ -27,16 +24,6 @@ def empty_password_pdf() -> bytes:
     buf = io.BytesIO()
     w.write(buf)
     return buf.getvalue()
-
-
-def make_root(tmp_path, files: dict) -> Path:
-    root = tmp_path / "proj"
-    root.mkdir(exist_ok=True)
-    for name, data in files.items():
-        p = root / name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(data if isinstance(data, bytes) else data.encode())
-    return root
 
 
 # ---- PDF edge cases ----------------------------------------------------------
@@ -143,7 +130,7 @@ def test_unchanged_pdf_not_reparsed(tmp_path):
 def test_each_image_extension_is_captioned(tmp_path, name):
     cap = FakeCaptioner("a blue square")
     s = make_store(tmp_path, cap)
-    assert rag.file_kind(name) == "image" and s.scannable(name)
+    assert rag.file_kind(name) == "image"
     assert s.put_file(1, name, PNG) == "captioned"
     assert cap.calls == 1
     assert texts(s)[0].startswith(f"[image: {name}]")
@@ -183,35 +170,6 @@ def test_unexpected_caption_exception_propagates_from_put_file(tmp_path, exc):
     with pytest.raises(type(exc)):
         s.put_file(1, "a.png", PNG)
     assert s.list_files(1) == []
-
-
-@pytest.mark.parametrize("exc", [ValueError("x"), KeyError("k")])
-def test_unexpected_caption_exception_in_scan_is_failed_not_abort(tmp_path, exc):
-    s = make_store(tmp_path, FakeCaptioner(fail=exc))
-    root = make_root(tmp_path, {"a.png": PNG, "b.py": "x = 1\n"})
-    stats = s.index_project(1, root, ["a.png", "b.py"])
-    assert stats["failed"] == 1 and stats["indexed"] == 1 and "aborted" not in stats
-
-
-def _status_error(code=500):
-    req = httpx.Request("POST", "http://x")
-    return httpx.HTTPStatusError("boom", request=req, response=httpx.Response(code, request=req))
-
-
-def test_http_status_error_does_not_abort_scan(tmp_path):
-    s = make_store(tmp_path, FakeCaptioner(fail=_status_error()))
-    root = make_root(tmp_path, {"a.png": PNG, "b.py": "x = 1\n"})
-    stats = s.index_project(1, root, ["a.png", "b.py"])
-    assert stats["failed"] == 1 and "aborted" not in stats and stats["indexed"] == 1
-
-
-@pytest.mark.parametrize("exc", [httpx.ConnectError("d"), httpx.ConnectTimeout("t"),
-                                 httpx.ReadTimeout("t"), httpx.RemoteProtocolError("p")])
-def test_transport_errors_abort_scan(tmp_path, exc):
-    s = make_store(tmp_path, FakeCaptioner(fail=exc))
-    root = make_root(tmp_path, {"a.png": PNG, "b.py": "x = 1\n"})
-    stats = s.index_project(1, root, ["a.png", "b.py"])
-    assert "aborted" in stats and stats["indexed"] == 0  # b.py never reached
 
 
 def test_ollama_captioner_exception_mapping(monkeypatch):
@@ -262,19 +220,6 @@ def test_ollama_captioner_sends_base64_image_and_model(monkeypatch):
     assert base64.b64decode(seen["json"]["messages"][0]["images"][0]) == PNG
 
 
-def test_failed_images_are_retried_on_every_run(tmp_path):
-    cap = FakeCaptioner(fail=rag.CaptionError("no"))
-    s = make_store(tmp_path, cap)
-    root = make_root(tmp_path, {"a.png": PNG})
-    assert s.index_project(1, root, ["a.png"])["skipped_image_failed"] == 1
-    assert s.index_project(1, root, ["a.png"])["skipped_image_failed"] == 1
-    assert cap.calls == 2  # not "unchanged"
-    cap.fail = None
-    stats = s.index_project(1, root, ["a.png"])
-    assert stats["captioned"] == 1 and stats["unchanged"] == 0
-    assert s.index_project(1, root, ["a.png"])["unchanged"] == 1
-
-
 def test_model_change_replaces_caption_chunks(tmp_path):
     s1 = make_store(tmp_path, FakeCaptioner("old caption zebra"), "v1")
     s1.put_file(1, "a.png", PNG)
@@ -293,79 +238,18 @@ def test_vision_model_change_does_not_recaption_text_or_pdf(tmp_path):
     assert s2.put_file(1, "a.pdf", make_pdf(["hi"])) == "unchanged"
 
 
-def test_failed_caption_keeps_old_index_and_is_not_pruned(tmp_path):
-    cap = FakeCaptioner("original caption")
-    s = make_store(tmp_path, cap)
-    root = make_root(tmp_path, {"a.png": PNG})
-    s.index_project(1, root, ["a.png"])
-    # image changes and the model now fails: previous caption must survive
-    (root / "a.png").write_bytes(PNG + b"extra")
-    cap.fail = rag.CaptionError("busy")
-    stats = s.index_project(1, root, ["a.png"], prune=True)
-    assert stats["skipped_image_failed"] == 1 and stats["deleted"] == 0
-    assert [f["path"] for f in s.list_files(1)] == ["a.png"]
-    assert any("original caption" in t for t in texts(s))
-    assert (s.files_dir / "1" / "a.png").read_bytes() == PNG
-
-
-def test_vision_disabled_scan_ignores_images_but_keeps_pdfs(tmp_path):
-    s = make_store(tmp_path, captioner=None, vision_model="")
-    root = make_root(tmp_path, {"a.png": PNG, "b.PNG": PNG, "c.pdf": make_pdf(["hi"]), "d.py": "x=1\n"})
-    from backend.routes import projects
-    old = rag_store.store
-    rag_store.store = s
-    try:
-        assert projects.scan_project(root) == ["c.pdf", "d.py"]
-    finally:
-        rag_store.store = old
-
-
 def test_vision_disabled_image_upload_is_skipped_not_error(tmp_path):
     s = make_store(tmp_path, captioner=None, vision_model="")
-    assert s.put_file(1, "a.png", PNG, "upload") == "skipped_image_disabled"
+    assert s.put_file(1, "a.png", PNG) == "skipped_image_disabled"
     assert s.list_files(1) == [] and not (s.files_dir / "1" / "a.png").exists()
 
 
 def test_store_without_captioner_but_vision_model_set_still_disabled(tmp_path):
     s = make_store(tmp_path, captioner=None, vision_model="v1")
-    assert not s.scannable("a.jpg")
     assert s.put_file(1, "a.jpg", PNG) == "skipped_image_disabled"
 
 
 # ---- size caps (store level) -----------------------------------------------
-
-class ReadSpy:
-    def __init__(self, monkeypatch):
-        self.calls = []
-        orig = Path.read_bytes
-
-        def spy(p):
-            self.calls.append(p.name)
-            return orig(p)
-
-        monkeypatch.setattr(Path, "read_bytes", spy)
-
-
-@pytest.mark.parametrize("name,kw,data", [
-    ("big.pdf", {"max_pdf_bytes": 50}, make_pdf(["hello"])),
-    ("big.png", {"max_image_bytes": 10}, PNG),
-    ("big.py", {}, b"#" * (rag.MAX_FILE_BYTES + 1)),
-])
-def test_sync_file_stats_before_reading_oversize(tmp_path, monkeypatch, name, kw, data):
-    s = make_store(tmp_path, FakeCaptioner(), **kw)
-    root = make_root(tmp_path, {name: data})
-    spy = ReadSpy(monkeypatch)
-    assert s.sync_file(1, root, name) == "skipped"
-    assert name not in spy.calls
-
-
-def test_sync_file_reads_file_within_cap(tmp_path, monkeypatch):
-    s = make_store(tmp_path, FakeCaptioner(), max_pdf_bytes=10_000)
-    root = make_root(tmp_path, {"ok.pdf": make_pdf(["hi"])})
-    spy = ReadSpy(monkeypatch)
-    assert s.sync_file(1, root, "ok.pdf") == "indexed"
-    assert "ok.pdf" in spy.calls
-
 
 def test_cap_boundary_is_inclusive(tmp_path):
     pdf = make_pdf(["edge"])
@@ -373,21 +257,12 @@ def test_cap_boundary_is_inclusive(tmp_path):
     assert make_store(tmp_path / "b", max_pdf_bytes=len(pdf) - 1).put_file(1, "e.pdf", pdf) == "skipped"
 
 
-def test_scan_drops_previously_indexed_file_that_grew_past_cap(tmp_path):
-    s = make_store(tmp_path, max_pdf_bytes=len(make_pdf(["hi"])))
-    root = make_root(tmp_path, {"g.pdf": make_pdf(["hi"])})
-    assert s.sync_file(1, root, "g.pdf") == "indexed"
-    (root / "g.pdf").write_bytes(make_pdf(["hi"]) + b"\n%" + b"x" * 100)
-    assert s.sync_file(1, root, "g.pdf") == "skipped"
-    assert s.list_files(1) == [] and not (s.files_dir / "1" / "g.pdf").exists()
-
-
 def test_oversize_image_put_file_is_skipped_without_captioning(tmp_path):
     s = make_store(tmp_path, max_image_bytes=4)
-    assert s.put_file(1, "a.png", PNG, "upload") == "skipped"
+    assert s.put_file(1, "a.png", PNG) == "skipped"
 
 
-# ---- path safety / shadowing -------------------------------------------------
+# ---- path safety -------------------------------------------------
 
 BAD_NAMES = ["C:/x.pdf", "C:\\x.png", "a.pdf:stream", "a.png:Zone.Identifier", "CON.png", "con.pdf",
              "sub/NUL.png", "COM1.pdf", "../x.pdf", "a/../../x.png", "/abs/x.pdf", "x.pdf.", "x.png ",
@@ -399,41 +274,9 @@ def test_put_file_rejects_unsafe_binary_names(tmp_path, bad):
     s = make_store(tmp_path, FakeCaptioner())
     data = make_pdf(["x"]) if "pdf" in bad else PNG
     with pytest.raises(ValueError):
-        s.put_file(1, bad, data, "upload")
+        s.put_file(1, bad, data)
     assert s.list_files(1) == []
     assert not any(p.is_file() for p in (tmp_path / "copies").rglob("*"))
-
-
-@pytest.mark.parametrize("bad", ["C:/x.pdf", "a.pdf:stream", "CON.png", "../x.pdf"])
-def test_sync_and_delete_reject_unsafe_names(tmp_path, bad):
-    s = make_store(tmp_path, FakeCaptioner())
-    root = make_root(tmp_path, {"ok.pdf": make_pdf(["x"])})
-    with pytest.raises(ValueError):
-        s.sync_file(1, root, bad)
-    with pytest.raises(ValueError):
-        s.delete_file(1, bad)
-
-
-def test_scan_cannot_shadow_uploaded_pdf_or_png(tmp_path):
-    s = make_store(tmp_path, FakeCaptioner("uploaded caption"))
-    s.put_file(1, "a.png", PNG, "upload")
-    s.put_file(1, "d.pdf", make_pdf(["uploaded text"]), "upload")
-    root = make_root(tmp_path, {"a.png": PNG + b"!", "d.pdf": make_pdf(["scanned text"])})
-    stats = s.index_project(1, root, ["a.png", "d.pdf"])
-    assert stats["shadowed"] == 2
-    joined = " ".join(texts(s))
-    assert "uploaded text" in joined and "scanned text" not in joined
-    assert (s.files_dir / "1" / "a.png").read_bytes() == PNG
-
-
-def test_uploaded_binary_survives_prune(tmp_path):
-    s = make_store(tmp_path, FakeCaptioner())
-    s.put_file(1, "u.pdf", make_pdf(["mine"]), "upload")
-    s.put_file(1, "u.png", PNG, "upload")
-    root = make_root(tmp_path, {"k.py": "x = 1\n"})
-    stats = s.index_project(1, root, ["k.py"])
-    assert stats["deleted"] == 0
-    assert {f["path"] for f in s.list_files(1)} == {"u.pdf", "u.png", "k.py"}
 
 
 def test_symlink_copy_cannot_escape(tmp_path):
@@ -447,7 +290,7 @@ def test_symlink_copy_cannot_escape(tmp_path):
     except (OSError, NotImplementedError):
         pytest.skip("symlinks not permitted")
     with pytest.raises(ValueError):
-        s.put_file(1, "link/x.png", PNG, "upload")
+        s.put_file(1, "link/x.png", PNG)
     assert not any(outside.iterdir())
 
 
@@ -475,78 +318,49 @@ def test_delete_project_removes_binary_copies_only_for_that_project(tmp_path):
     assert (s.files_dir / "2" / "a.png").exists() and s.has_index(2)
 
 
-def test_scanned_image_deleted_from_disk_is_pruned_with_copy(tmp_path):
-    s = make_store(tmp_path, FakeCaptioner())
-    root = make_root(tmp_path, {"a.png": PNG, "k.py": "x=1\n"})
-    s.index_project(1, root, ["a.png", "k.py"])
-    (root / "a.png").unlink()
-    stats = s.index_project(1, root, ["k.py"])
-    assert stats["deleted"] == 1
-    assert not (s.files_dir / "1" / "a.png").exists()
-
-
 # ---- stats back-compat --------------------------------------------------------
-
-def test_stats_keys_for_text_only_run_are_original(tmp_path):
-    s = make_store(tmp_path, FakeCaptioner())
-    root = make_root(tmp_path, {"a.py": "x=1\n", "b.md": "# hi\n"})
-    stats = s.index_project(1, root, ["a.py", "b.md"])
-    assert set(stats) == ORIGINAL_KEYS
-    assert stats["indexed"] == 2 and stats["skipped"] == 0
-    assert set(s.index_project(1, root, ["a.py", "b.md"])) == ORIGINAL_KEYS
-
-
-def test_specific_skip_keys_appear_only_when_they_occur(tmp_path):
-    s = make_store(tmp_path, FakeCaptioner())
-    root = make_root(tmp_path, {"s.pdf": make_pdf([""]), "bad.pdf": b"nope"})
-    stats = s.index_project(1, root, ["s.pdf", "bad.pdf"])
-    assert stats["skipped_pdf_no_text"] == 1 and stats["skipped_pdf_unreadable"] == 1
-    assert stats["skipped"] == 2 and "captioned" not in stats and "skipped_image_failed" not in stats
-    assert ORIGINAL_KEYS <= set(stats)
-
 
 # ---- scan_project / build_context_block ---------------------------------------
 
-@pytest.fixture
-def with_store(tmp_path, monkeypatch):
-    def install(captioner=FakeCaptioner(), vision="v1"):
-        monkeypatch.setattr(rag_store, "store", make_store(tmp_path, captioner, vision))
-    install()
-    return install
-
-
-def test_scan_project_text_only_semantics(tmp_path, with_store):
-    from backend.routes.projects import scan_project
-    root = make_root(tmp_path, {"a.py": "x", "B.PDF": make_pdf(["x"]), "c.PNG": PNG,
-                                "node_modules/d.py": "x", "sub/e.md": "x", "f.tiff": b"zz"})
-    assert scan_project(root, text_only=True) == ["a.py", "sub/e.md"]
-    assert scan_project(root) == ["B.PDF", "a.py", "c.PNG", "sub/e.md"]
-    assert scan_project(root, q="SUB", text_only=True) == ["sub/e.md"]
-    assert scan_project(root, q="pdf", text_only=True) == []
-    with_store(captioner=None, vision="")
-    assert scan_project(root) == ["B.PDF", "a.py", "sub/e.md"]
-
-
-def test_scan_project_limit_counts_only_matching_files(tmp_path, with_store):
-    from backend.routes.projects import scan_project
-    root = make_root(tmp_path, {f"{i}.pdf": make_pdf(["x"]) for i in range(5)} | {"z.py": "x"})
-    assert scan_project(root, limit=1, text_only=True) == ["z.py"]
-    assert len(scan_project(root, limit=3)) == 3
-
-
-def test_build_context_block_refuses_binary_in_any_case(tmp_path, monkeypatch):
-    from backend.routes.chat import build_context_block
-    monkeypatch.setattr(database, "DB_PATH", tmp_path / "server.db")
-    server.init_db()
-    root = make_root(tmp_path, {"a.PDF": make_pdf(["secret"]), "b.PNG": PNG, "c.jpeg": PNG, "n.md": "visible"})
-    c = TestClient(server.app)
-    pid = c.post("/api/projects", json={"name": "p", "path": str(root)}).json()["id"]
-    assert build_context_block(pid, ["a.PDF", "b.PNG", "c.jpeg"]) == ""
-    block = build_context_block(pid, ["a.PDF", "n.md", "b.PNG"])
-    assert "visible" in block and "%PDF" not in block and "PNG" not in block and "a.PDF" not in block
-
-
 # ---- API ------------------------------------------------------------------------
+
+
+def test_failed_caption_keeps_old_index(tmp_path):
+    cap = FakeCaptioner("original caption")
+    s = make_store(tmp_path, cap)
+    s.put_file(1, "a.png", PNG)
+    # the image changes and the model now fails: the previous caption must survive
+    cap.fail = rag.CaptionError("busy")
+    assert s.put_file(1, "a.png", PNG + b"extra") == "skipped_image_failed"
+    assert [f["path"] for f in s.list_files(1)] == ["a.png"]
+    assert any("original caption" in t for t in texts(s))
+    assert (s.files_dir / "1" / "a.png").read_bytes() == PNG
+
+
+def test_failed_caption_is_retried_on_next_upload(tmp_path):
+    cap = FakeCaptioner(fail=rag.CaptionError("no"))
+    s = make_store(tmp_path, cap)
+    assert s.put_file(1, "a.png", PNG) == "skipped_image_failed"
+    assert s.put_file(1, "a.png", PNG) == "skipped_image_failed"
+    assert cap.calls == 2  # not remembered as "unchanged"
+    cap.fail = None
+    assert s.put_file(1, "a.png", PNG) == "captioned"
+    assert s.put_file(1, "a.png", PNG) == "unchanged"
+
+
+@pytest.mark.parametrize("bad", ["C:/x.pdf", "a.pdf:stream", "CON.png", "../x.pdf"])
+def test_delete_file_rejects_unsafe_names(tmp_path, bad):
+    s = make_store(tmp_path, FakeCaptioner())
+    with pytest.raises(ValueError):
+        s.delete_file(1, bad)
+
+
+# ---- upload API --------------------------------------------------------------
+
+def _status_error(code=500):
+    req = httpx.Request("POST", "http://x")
+    return httpx.HTTPStatusError("boom", request=req, response=httpx.Response(code, request=req))
+
 
 def _client(tmp_path, monkeypatch, captioner, vision="v1", **kw):
     monkeypatch.setattr(database, "DB_PATH", tmp_path / "server.db")
@@ -555,77 +369,36 @@ def _client(tmp_path, monkeypatch, captioner, vision="v1", **kw):
     return TestClient(server.app)
 
 
-def _project(c, root):
-    return c.post("/api/projects", json={"name": "p", "path": str(root)}).json()["id"]
+def _project(c):
+    return c.post("/api/projects", json={"name": "p"}).json()["id"]
 
 
-def test_index_endpoint_502_on_vision_connection_error(tmp_path, monkeypatch):
-    c = _client(tmp_path, monkeypatch, FakeCaptioner(fail=httpx.ConnectError("down")))
-    pid = _project(c, make_root(tmp_path, {"a.png": PNG}))
-    r = c.post(f"/api/projects/{pid}/index")
-    assert r.status_code == 502
-    assert "Ollama unreachable" in r.json()["detail"]
-
-
-def test_index_endpoint_caption_failure_is_200_with_stats(tmp_path, monkeypatch):
-    c = _client(tmp_path, monkeypatch, FakeCaptioner(fail=rag.CaptionError("no")))
-    pid = _project(c, make_root(tmp_path, {"a.png": PNG, "k.py": "x=1\n"}))
-    r = c.post(f"/api/projects/{pid}/index")
+def _up(c, pid, name, data):
+    """Upload one file; returns its entry of the per-file results."""
+    r = c.post(f"/api/projects/{pid}/files", files={"files": (name, data)})
     assert r.status_code == 200
-    body = r.json()
-    assert body["skipped_image_failed"] == 1 and body["indexed"] == 1 and "aborted" not in body
-    assert [f["path"] for f in c.get(f"/api/projects/{pid}/index").json()] == ["k.py"]
+    return r.json()["results"][0]
 
 
-def test_index_endpoint_http_status_error_counts_as_failed(tmp_path, monkeypatch):
-    c = _client(tmp_path, monkeypatch, FakeCaptioner(fail=_status_error(500)))
-    pid = _project(c, make_root(tmp_path, {"a.png": PNG}))
-    r = c.post(f"/api/projects/{pid}/index")
-    assert r.status_code == 200 and r.json()["failed"] == 1
+def _no_copies(tmp_path):
+    return not any(p.is_file() for p in (tmp_path / "copies").rglob("*"))
 
 
-def test_index_endpoint_with_vision_disabled_ignores_images(tmp_path, monkeypatch):
+def test_upload_vision_disabled_is_a_skipped_result(tmp_path, monkeypatch):
     c = _client(tmp_path, monkeypatch, None, "")
-    pid = _project(c, make_root(tmp_path, {"a.png": PNG, "d.pdf": make_pdf(["hi"])}))
-    stats = c.post(f"/api/projects/{pid}/index").json()
-    assert set(stats) == ORIGINAL_KEYS and stats["indexed"] == 1
-    assert [f["path"] for f in c.get(f"/api/projects/{pid}/index").json()] == ["d.pdf"]
+    assert _up(c, _project(c), "a.png", PNG) == {"path": "a.png", "result": "skipped_image_disabled"}
 
 
-def test_index_file_endpoint_502_on_connection_error(tmp_path, monkeypatch):
-    c = _client(tmp_path, monkeypatch, FakeCaptioner(fail=httpx.ConnectError("down")))
-    pid = _project(c, make_root(tmp_path, {"a.png": PNG}))
-    assert c.post(f"/api/projects/{pid}/index/file", params={"path": "a.png"}).status_code == 502
+@pytest.mark.parametrize("fail", [httpx.ConnectError("down"), _status_error()])
+def test_upload_ollama_failure_is_a_502_entry(tmp_path, monkeypatch, fail):
+    c = _client(tmp_path, monkeypatch, FakeCaptioner(fail=fail))
+    res = _up(c, _project(c), "a.png", PNG)
+    assert res["result"] == "error" and res["status"] == 502
 
 
-@pytest.mark.parametrize("bad", ["C:/x.pdf", "a.pdf:stream", "CON.png", "../x.png"])
-def test_index_file_endpoint_rejects_unsafe_binary_paths(tmp_path, monkeypatch, bad):
-    c = _client(tmp_path, monkeypatch, FakeCaptioner())
-    pid = _project(c, make_root(tmp_path, {"ok.py": "x"}))
-    assert c.post(f"/api/projects/{pid}/index/file", params={"path": bad}).status_code == 400
-    assert c.delete(f"/api/projects/{pid}/index/file", params={"path": bad}).status_code == 400
-
-
-def test_upload_vision_disabled_returns_skipped_result(tmp_path, monkeypatch):
-    c = _client(tmp_path, monkeypatch, None, "")
-    pid = _project(c, make_root(tmp_path, {"k.py": "x"}))
-    r = c.post(f"/api/projects/{pid}/upload", files={"file": ("a.png", PNG)})
-    assert r.status_code == 200 and r.json() == {"path": "a.png", "result": "skipped_image_disabled"}
-
-
-def test_upload_connection_error_is_502_and_status_error_too(tmp_path, monkeypatch):
-    c = _client(tmp_path, monkeypatch, FakeCaptioner(fail=httpx.ConnectError("down")))
-    pid = _project(c, make_root(tmp_path, {"k.py": "x"}))
-    assert c.post(f"/api/projects/{pid}/upload", files={"file": ("a.png", PNG)}).status_code == 502
-    c = _client(tmp_path, monkeypatch, FakeCaptioner(fail=_status_error()))
-    assert c.post(f"/api/projects/{pid}/upload", files={"file": ("a.png", PNG)}).status_code == 502
-
-
-def test_upload_caption_error_is_200_skipped(tmp_path, monkeypatch):
+def test_upload_caption_error_is_skipped(tmp_path, monkeypatch):
     c = _client(tmp_path, monkeypatch, FakeCaptioner(fail=rag.CaptionError("no")))
-    pid = _project(c, make_root(tmp_path, {"k.py": "x"}))
-    r = c.post(f"/api/projects/{pid}/upload", files={"file": ("a.png", PNG)})
-    assert r.status_code == 200 and r.json()["result"] == "skipped_image_failed"
+    assert _up(c, _project(c), "a.png", PNG)["result"] == "skipped_image_failed"
 
 
 @pytest.mark.parametrize("name,kw,data", [
@@ -634,71 +407,56 @@ def test_upload_caption_error_is_200_skipped(tmp_path, monkeypatch):
     ("a.jpg", {"max_image_bytes": 8}, PNG),
     ("a.py", {}, b"#" * (rag.MAX_FILE_BYTES + 1)),
 ])
-def test_upload_over_cap_is_413_and_leaves_no_state(tmp_path, monkeypatch, name, kw, data):
+def test_upload_over_cap_is_413_entry_and_leaves_no_state(tmp_path, monkeypatch, name, kw, data):
     c = _client(tmp_path, monkeypatch, FakeCaptioner(), **kw)
-    pid = _project(c, make_root(tmp_path, {"k.py": "x"}))
-    r = c.post(f"/api/projects/{pid}/upload", files={"file": (name, data)})
-    assert r.status_code == 413
-    assert c.get(f"/api/projects/{pid}/index").json() == []
-    assert not any(p.is_file() for p in (tmp_path / "copies").rglob("*"))
+    pid = _project(c)
+    res = _up(c, pid, name, data)
+    assert res["result"] == "error" and res["status"] == 413
+    assert c.get(f"/api/projects/{pid}/files").json() == []
+    assert _no_copies(tmp_path)
 
 
 def test_upload_exactly_at_cap_accepted_one_over_rejected(tmp_path, monkeypatch):
     pdf = make_pdf(["edge"])
     c = _client(tmp_path, monkeypatch, FakeCaptioner(), max_pdf_bytes=len(pdf))
-    pid = _project(c, make_root(tmp_path, {"k.py": "x"}))
-    assert c.post(f"/api/projects/{pid}/upload", files={"file": ("a.pdf", pdf)}).status_code == 200
-    assert c.post(f"/api/projects/{pid}/upload", files={"file": ("b.pdf", pdf + b"%")}).status_code == 413
+    pid = _project(c)
+    assert _up(c, pid, "a.pdf", pdf)["result"] == "indexed"
+    assert _up(c, pid, "b.pdf", pdf + b"%")["status"] == 413
 
 
 def test_upload_image_above_text_cap_but_under_image_cap_ok(tmp_path, monkeypatch):
     c = _client(tmp_path, monkeypatch, FakeCaptioner())
-    pid = _project(c, make_root(tmp_path, {"k.py": "x"}))
     big = PNG + b"\x00" * (rag.MAX_FILE_BYTES + 10)
-    r = c.post(f"/api/projects/{pid}/upload", files={"file": ("big.png", big)})
-    assert r.status_code == 200 and r.json()["result"] == "captioned"
+    assert _up(c, _project(c), "big.png", big)["result"] == "captioned"
 
 
-@pytest.mark.parametrize("bad", ["C:/x.pdf", "a.pdf:stream", "CON.png", "sub/NUL.pdf", "../x.png",
-                                 "/abs/x.pdf", "x.png."])
-def test_upload_rejects_unsafe_path_field(tmp_path, monkeypatch, bad):
+@pytest.mark.parametrize("filename", ["a.pdf:stream", "CON.png", "COM3.pdf", "sub/NUL.pdf", "x.png."])
+def test_upload_unsafe_filename_is_a_400_entry(tmp_path, monkeypatch, filename):
     c = _client(tmp_path, monkeypatch, FakeCaptioner())
-    pid = _project(c, make_root(tmp_path, {"k.py": "x"}))
-    r = c.post(f"/api/projects/{pid}/upload", files={"file": ("f.bin", PNG)}, data={"path": bad})
-    assert r.status_code == 400
-    assert c.get(f"/api/projects/{pid}/index").json() == []
-    assert not any(p.is_file() for p in (tmp_path / "copies").rglob("*"))
+    pid = _project(c)
+    res = _up(c, pid, filename, PNG)
+    assert res["result"] == "error" and res["status"] == 400
+    assert c.get(f"/api/projects/{pid}/files").json() == []
+    assert _no_copies(tmp_path)
 
 
-@pytest.mark.parametrize("filename", ["a.pdf:stream", "CON.png", "COM3.pdf"])
-def test_upload_rejects_unsafe_filename_when_no_path(tmp_path, monkeypatch, filename):
+@pytest.mark.parametrize("filename,expected", [
+    ("C:/x.pdf", "x.pdf"), ("C:\\dir\\x.pdf", "x.pdf"), ("../x.pdf", "x.pdf"), ("/abs/x.pdf", "x.pdf"),
+])
+def test_upload_filename_is_reduced_to_basename(tmp_path, monkeypatch, filename, expected):
     c = _client(tmp_path, monkeypatch, FakeCaptioner())
-    pid = _project(c, make_root(tmp_path, {"k.py": "x"}))
-    r = c.post(f"/api/projects/{pid}/upload", files={"file": (filename, PNG)})
-    assert r.status_code == 400
+    res = _up(c, _project(c), filename, make_pdf(["hi"]))
+    assert res == {"path": expected, "result": "indexed"}
 
 
-def test_upload_filename_with_drive_prefix_is_reduced_to_basename(tmp_path, monkeypatch):
+def test_delete_file_and_delete_project_clean_copies(tmp_path, monkeypatch):
     c = _client(tmp_path, monkeypatch, FakeCaptioner())
-    pid = _project(c, make_root(tmp_path, {"k.py": "x"}))
-    r = c.post(f"/api/projects/{pid}/upload", files={"file": ("C:/x.pdf", make_pdf(["hi"]))})
-    assert r.status_code == 200 and r.json()["path"] == "x.pdf"
-
-
-def test_delete_endpoint_and_project_delete_clean_copies(tmp_path, monkeypatch):
-    c = _client(tmp_path, monkeypatch, FakeCaptioner())
-    pid = _project(c, make_root(tmp_path, {"k.py": "x"}))
-    c.post(f"/api/projects/{pid}/upload", files={"file": ("a.pdf", make_pdf(["hi"]))})
-    c.post(f"/api/projects/{pid}/upload", files={"file": ("a.png", PNG)})
+    pid = _project(c)
+    _up(c, pid, "a.pdf", make_pdf(["hi"]))
+    _up(c, pid, "a.png", PNG)
     copies = tmp_path / "copies" / str(pid)
     assert (copies / "a.pdf").exists() and (copies / "a.png").exists()
-    assert c.delete(f"/api/projects/{pid}/index/file", params={"path": "a.png"}).json() == {"deleted": True}
+    assert c.delete(f"/api/projects/{pid}/files", params={"path": "a.png"}).json() == {"deleted": True}
     assert not (copies / "a.png").exists() and (copies / "a.pdf").exists()
     assert c.delete(f"/api/projects/{pid}").status_code == 200
     assert not copies.exists()
-
-
-def test_pinnable_files_endpoint_text_only_even_with_uppercase(tmp_path, monkeypatch):
-    c = _client(tmp_path, monkeypatch, FakeCaptioner())
-    pid = _project(c, make_root(tmp_path, {"A.PDF": make_pdf(["x"]), "B.PNG": PNG, "c.py": "x"}))
-    assert c.get(f"/api/projects/{pid}/files").json() == ["c.py"]

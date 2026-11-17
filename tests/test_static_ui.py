@@ -111,7 +111,7 @@ def _match(route_path: str, path: str) -> bool:
 
 
 def test_js_calls_found():
-    assert len(_js_calls()) >= 20
+    assert len(_js_calls()) >= 12
 
 
 def test_every_api_url_in_app_js_has_a_registered_route_with_that_method():
@@ -135,8 +135,53 @@ def test_required_query_params_are_sent_by_app_js():
     assert not problems, "; ".join(problems)
 
 
-def test_upload_forms_send_file_field():
-    assert len(re.findall(r"append\(\s*'file'", JS)) >= 2
+def test_upload_forms_send_the_right_field_names():
+    assert re.search(r"append\(\s*'file'", JS)  # general file transfer: POST /api/upload
+    assert re.search(r"append\(\s*'files'", JS)  # project upload: POST /api/projects/{id}/files
+
+
+def test_js_uses_the_project_workspace_endpoints():
+    calls = {(m, p) for m, p, _q, _n in _js_calls()}
+    for want in [
+        ("GET", "/api/projects"), ("POST", "/api/projects"), ("GET", "/api/projects/{}"),
+        ("DELETE", "/api/projects/{}"), ("POST", "/api/projects/{}/sessions"),
+        ("POST", "/api/projects/{}/files"), ("DELETE", "/api/projects/{}/files"),
+        ("GET", "/api/sessions"), ("POST", "/api/sessions"), ("POST", "/api/chat"),
+    ]:
+        assert want in calls, want
+
+
+@pytest.mark.parametrize("gone", ["/context", "/grep", "/index", "/upload'", "ctxDlg", "ctxSelected", "idxDlg"])
+def test_folder_and_pinned_file_ui_is_gone(gone):
+    assert gone not in JS.replace("'/api/upload'", "") and gone not in HTML
+
+
+def test_sidebar_has_chats_and_projects_sections():
+    for needle in ('id="sessions"', 'id="projects"', 'id="newBtn"', 'id="newProjBtn"', "New chat", "New project"):
+        assert needle in HTML, needle
+
+
+def test_project_view_has_upload_and_file_list_controls():
+    for i in ("projectView", "projNewChat", "dropZone", "projUpload", "upResult", "projFiles", "projDelBtn"):
+        assert f'id="{i}"' in HTML, i
+    assert re.search(r'id="projUpload"[^>]*multiple', HTML)
+
+
+def test_project_delete_requires_confirm():
+    m = re.search(r"\$\('projDelBtn'\)\.onclick = guard\(async \(\) => \{(.*?)\n\}\);", JS, re.S)
+    assert m and m.group(1).index("confirm(") < m.group(1).index("method: 'DELETE'")
+
+
+def test_sources_header_name_matches_the_server():
+    from backend.routes.chat import SOURCES_HEADER
+    assert f"'{SOURCES_HEADER}'" in JS
+
+
+def test_innerhtml_only_gets_escaped_markdown_or_a_fixed_literal():
+    uses = re.findall(r"\.innerHTML\s*=\s*([^;\n]*)", JS)
+    assert uses  # the regex found them
+    for u in uses:
+        assert u.startswith("markdown(") or u.startswith("'<span class=\"typing\""), u
 
 
 @pytest.mark.parametrize("name", ["index.html", "app.js", "style.css", "theme.js"])

@@ -12,44 +12,87 @@
 
 <div id="scrim" aria-hidden="true"></div>
 
-<aside id="side" aria-label="Sessions and tools">
+<aside id="side" aria-label="Chats and projects">
   <div class="brand">
     <span class="logo" aria-hidden="true">&#9670;</span>
     <span>Local LLM</span>
     <button class="icon" id="themeBtn" title="Toggle light/dark theme" aria-label="Toggle light/dark theme"></button>
   </div>
-  <button class="primary wide" id="newBtn">+ New chat</button>
-  <nav class="list" id="sessions" aria-label="Sessions"></nav>
+
+  <section class="sec grow3" aria-labelledby="chatsH">
+    <div class="sec-h">
+      <h2 id="chatsH">Chats</h2>
+      <button class="primary small" id="newBtn">+ New chat</button>
+    </div>
+    <nav class="list" id="sessions" aria-label="Chats"></nav>
+  </section>
+
+  <section class="sec grow2" aria-labelledby="projsH">
+    <div class="sec-h">
+      <h2 id="projsH">Projects</h2>
+      <button class="ghost small" id="newProjBtn">+ New project</button>
+    </div>
+    <nav class="list" id="projects" aria-label="Projects"></nav>
+  </section>
+
   <div class="side-f">
-    <button class="ghost" id="projBtn">Projects</button>
-    <button class="ghost" id="filesBtn">Files</button>
+    <button class="ghost" id="filesBtn">File transfer</button>
   </div>
 </aside>
 
 <main>
   <header>
-    <button class="icon" id="menuBtn" aria-label="Open sessions" aria-controls="side">&#9776;</button>
+    <button class="icon" id="menuBtn" aria-label="Open chats and projects" aria-controls="side">&#9776;</button>
     <div class="head-t">
-      <div class="title" id="title">No session</div>
+      <div class="title" id="title">New chat</div>
       <div class="sub" id="sub"></div>
     </div>
-    <button class="ghost" id="ctxBtn">Context</button>
+    <button class="ghost" id="projLink" hidden></button>
   </header>
-  <div class="chips" id="chips" aria-label="Pinned files"></div>
 
-  <div id="log" role="log" aria-live="polite" aria-label="Conversation">
-    <div class="empty" id="empty">
-      <div class="logo big" aria-hidden="true">&#9670;</div>
-      <h2>Ask your local model</h2>
-      <p>Chats stay on this machine. Pick a project under <b>Context</b> to ground answers in your files, PDFs and images.</p>
+  <!-- project workspace -->
+  <section id="projectView" aria-label="Project" hidden>
+    <div class="pv">
+      <div class="pv-h">
+        <h1 id="projName"></h1>
+        <button class="ghost danger" id="projDelBtn">Delete project</button>
+      </div>
+      <p class="muted">Chats in a project share the files uploaded here: every file is indexed once and each chat retrieves from it.</p>
+
+      <div class="card">
+        <div class="card-h">
+          <h2>Chats</h2>
+          <button class="primary small" id="projNewChat">New chat in project</button>
+        </div>
+        <div class="stack tight" id="projSessions"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-h"><h2>Files</h2></div>
+        <label class="drop" id="dropZone" for="projUpload">Drop files here or click to choose<input type="file" id="projUpload" multiple></label>
+        <div class="muted">Text, PDFs (text layer) and images (described by a vision model). Each file is indexed as it is uploaded.</div>
+        <div class="stack" id="upResult" aria-live="polite" hidden></div>
+        <div class="stack" id="projFiles"></div>
+      </div>
     </div>
-  </div>
+  </section>
 
-  <form class="ask" id="ask">
-    <label for="q" class="sr">Message</label>
-    <textarea id="q" rows="1" placeholder="Ask something..." autocomplete="off" enterkeyhint="send"></textarea>
-    <button class="primary" id="send" aria-label="Send">Send</button>
-  </form>
+  <!-- conversation -->
+  <section id="chatView" aria-label="Conversation">
+    <div id="log" role="log" aria-live="polite" aria-label="Messages">
+      <div class="empty" id="empty">
+        <div class="logo big" aria-hidden="true">&#9670;</div>
+        <h2>Ask your local model</h2>
+        <p id="emptyText">Chats stay on this machine.</p>
+      </div>
+    </div>
+
+    <form class="ask" id="ask">
+      <label for="q" class="sr">Message</label>
+      <textarea id="q" rows="1" placeholder="Ask something..." autocomplete="off" enterkeyhint="send"></textarea>
+      <button class="primary" id="send" aria-label="Send">Send</button>
+    </form>
+  </section>
 </main>
 
 <!-- file transfer -->
@@ -57,59 +100,23 @@
   <div class="dlg-h" id="filesH">File transfer</div>
   <div class="dlg-b">
     <label class="drop" for="upInput">Choose files to send to the laptop<input type="file" id="upInput" multiple></label>
-    <div class="muted">Uploads land in ./uploads on the laptop.</div>
+    <div class="muted">Uploads land in ./uploads on the laptop. To give a project files to work with, upload them inside the project instead.</div>
     <div class="stack" id="fileList"></div>
   </div>
   <div class="dlg-f"><button class="ghost" data-close>Close</button></div>
 </dialog>
 
-<!-- projects -->
-<dialog id="projDlg" aria-labelledby="projH">
-  <div class="dlg-h" id="projH">Projects</div>
+<!-- new project -->
+<dialog id="newProjDlg" aria-labelledby="newProjH">
+  <div class="dlg-h" id="newProjH">New project</div>
   <div class="dlg-b">
-    <div class="stack" id="projList"></div>
-    <div class="muted">Add a folder on the laptop, e.g. C:\work\project-x</div>
-    <label class="sr" for="projName">Project name</label>
-    <input id="projName" placeholder="Name">
-    <label class="sr" for="projPath">Folder path</label>
-    <input id="projPath" placeholder="Absolute path">
-    <button class="primary" id="addProj">Add project</button>
-  </div>
-  <div class="dlg-f"><button class="ghost" data-close>Close</button></div>
-</dialog>
-
-<!-- project index -->
-<dialog id="idxDlg" aria-labelledby="idxH">
-  <div class="dlg-h" id="idxH">Project index</div>
-  <div class="dlg-b">
-    <div class="row-actions">
-      <button class="primary" id="indexBtn">Index project</button>
-      <label class="btn ghost" for="projUpload">Add files<input type="file" id="projUpload" multiple
-        accept=".pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp,text/*,.md,.py,.js,.ts,.java,.json,.yaml,.yml,.xml,.sql,.html,.css,.toml,.sh"></label>
-    </div>
-    <div class="muted">Indexes text files, PDFs (text layer) and images (described by a vision model). Unchanged files are skipped.</div>
-    <div id="idxResult" class="result" hidden></div>
-    <div class="stack" id="idxFiles"></div>
-  </div>
-  <div class="dlg-f"><button class="ghost" data-close>Close</button></div>
-</dialog>
-
-<!-- context -->
-<dialog id="ctxDlg" aria-labelledby="ctxH">
-  <div class="dlg-h" id="ctxH">Session context</div>
-  <div class="dlg-b">
-    <label class="sr" for="ctxProject">Project</label>
-    <select id="ctxProject"></select>
-    <label class="sr" for="ctxFilter">Filter by path</label>
-    <input id="ctxFilter" placeholder="Filter by path">
-    <label class="sr" for="ctxGrep">Search contents</label>
-    <input id="ctxGrep" placeholder="Or search file contents, then press Enter">
-    <div class="muted" id="ctxCount" aria-live="polite"></div>
-    <div class="stack tight" id="ctxFiles"></div>
+    <div class="muted">A project is a workspace with its own chats and files. Chats in it share what you upload.</div>
+    <label class="sr" for="projNameInput">Project name</label>
+    <input id="projNameInput" placeholder="Project name" maxlength="100" autocomplete="off">
   </div>
   <div class="dlg-f">
     <button class="ghost" data-close>Cancel</button>
-    <button class="primary" id="saveCtx">Save</button>
+    <button class="primary" id="createProj">Create</button>
   </div>
 </dialog>
 

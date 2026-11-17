@@ -1,101 +1,81 @@
-"""Registered project folders: CRUD, file listing and content search."""
-
-from pathlib import Path
+"""Projects: named workspaces that own sessions and uploaded files."""
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-import rag
 from backend import rag_store
-from backend.config import CODE_EXT, SKIP_DIRS
+from backend.config import PROJECT_NAME_MAX
 from backend.database import db
+from backend.routes.sessions import NewSession, insert_session
 
 router = APIRouter()
 
 
 class NewProject(BaseModel):
     name: str
-    path: str
+
+
+def require_project(pid: int) -> dict:
+    """The project row, or 404."""
+    with db() as c:
+        row = c.execute("SELECT id, name FROM projects WHERE id = ?", (pid,)).fetchone()
+    if not row:
+        raise HTTPException(404, "no such project")
+    return dict(row)
 
 
 @router.get("/api/projects")
 def list_projects():
     with db() as c:
-        return [dict(r) for r in c.execute("SELECT * FROM projects ORDER BY name")]
+        rows = c.execute("SELECT id, name FROM projects ORDER BY name COLLATE NOCASE, id").fetchall()
+    return [dict(r) for r in rows]
 
 
 @router.post("/api/projects")
 def create_project(body: NewProject):
-    p = Path(body.path).expanduser()
-    if not p.is_dir():
-        raise HTTPException(400, f"not a directory: {p}")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "project name is required")
+    if len(name) > PROJECT_NAME_MAX:
+        raise HTTPException(400, f"project name is too long (max {PROJECT_NAME_MAX} characters)")
     with db() as c:
-        cur = c.execute(
-            "INSERT INTO projects (name, path) VALUES (?,?)", (body.name, str(p))
-        )
-        return {"id": cur.lastrowid}
+        # path is a legacy column from when projects were disk folders
+        cur = c.execute("INSERT INTO projects (name, path) VALUES (?, '')", (name,))
+        return {"id": cur.lastrowid, "name": name}
+
+
+@router.get("/api/projects/{pid}")
+def get_project(pid: int):
+    """The project with its sessions (newest first) and its indexed files."""
+    project = require_project(pid)
+    with db() as c:
+        sessions = c.execute(
+            "SELECT id, title, project_id, created_at FROM sessions WHERE project_id = ? "
+            "ORDER BY created_at DESC, id DESC",
+            (pid,),
+        ).fetchall()
+    project["sessions"] = [dict(s) for s in sessions]
+    project["files"] = rag_store.store.list_files(pid)
+    return project
 
 
 @router.delete("/api/projects/{pid}")
 def delete_project(pid: int):
+    """Delete the project with its sessions, messages, files, chunks and copies."""
     with db() as c:
+        c.execute(
+            "DELETE FROM messages WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?)",
+            (pid,),
+        )
+        c.execute("DELETE FROM sessions WHERE project_id = ?", (pid,))
         c.execute("DELETE FROM projects WHERE id = ?", (pid,))
     rag_store.store.delete_project(pid)
     return {"ok": True}
 
 
-def project_root(pid: int) -> Path:
+@router.post("/api/projects/{pid}/sessions")
+def create_project_session(pid: int, body: NewSession | None = None):
+    """A new session inside the project (any ``project_id`` in the body is ignored)."""
+    require_project(pid)
     with db() as c:
-        row = c.execute("SELECT path FROM projects WHERE id = ?", (pid,)).fetchone()
-    if not row:
-        raise HTTPException(404, "no such project")
-    return Path(row["path"])
-
-
-def scan_project(root: Path, q: str = "", limit: int = 2000, text_only: bool = False) -> list[str]:
-    """Relative paths of indexable files under root, optionally filtered by substring.
-
-    ``text_only`` leaves out PDFs and images (what can be pinned as context).
-    """
-    out = []
-    for f in root.rglob("*"):
-        rel = f.relative_to(root).as_posix()
-        if not rag_store.store.scannable(rel) or not f.is_file():
-            continue
-        if text_only and rag.file_kind(rel) != "text":
-            continue
-        if q and q.lower() not in rel.lower():
-            continue
-        out.append(rel)
-        if len(out) >= limit:
-            break
-    return sorted(out)
-
-
-@router.get("/api/projects/{pid}/files")
-def project_files(pid: int, q: str = ""):
-    """Relative paths of text files in the project that can be pinned, optionally filtered."""
-    return scan_project(project_root(pid), q, text_only=True)
-
-
-@router.get("/api/projects/{pid}/grep")
-def project_grep(pid: int, q: str):
-    """Files whose contents mention q. Useful for finding context to attach."""
-    if not q.strip():
-        return []
-    root = project_root(pid)
-    hits = []
-    needle = q.lower()
-    for f in root.rglob("*"):
-        if not f.is_file() or f.suffix.lower() not in CODE_EXT:
-            continue
-        if any(part in SKIP_DIRS for part in f.parts):
-            continue
-        try:
-            if needle in f.read_text(encoding="utf-8", errors="ignore").lower():
-                hits.append(str(f.relative_to(root)).replace("\\", "/"))
-        except OSError:
-            continue
-        if len(hits) >= 50:
-            break
-    return sorted(hits)
+        return {"id": insert_session(c, (body.title if body else "New chat"), pid)}

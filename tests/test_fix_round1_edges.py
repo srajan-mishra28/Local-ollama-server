@@ -1,4 +1,4 @@
-"""Edge tests for fix round 1: PDF char budget, _keeps, caption cap, zero-byte images,
+"""Edge tests for fix round 1: PDF char budget, caption cap, zero-byte images,
 format_hits escaping, and static UI checks (no browser, node unavailable)."""
 import re
 import sys
@@ -10,13 +10,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import rag  # noqa: E402
 from test_pdf_images import PNG, FakeCaptioner, make_pdf, make_store  # noqa: E402
-
-
-@pytest.fixture
-def root(tmp_path):
-    r = tmp_path / "proj"
-    r.mkdir()
-    return r
 
 
 # ---- per-page PDF truncation -------------------------------------------------
@@ -57,98 +50,6 @@ def test_pdf_budget_applies_through_put_file(tmp_path, monkeypatch):
     assert "bbb" in joined and "ccccc" not in joined and "[page 3]" not in joined
 
 
-# ---- _keeps / vision disabled ------------------------------------------------
-
-def _seed(tmp_path, root):
-    (root / "a.png").write_bytes(PNG)
-    (root / "b.py").write_text("x = 1\n")
-    (root / "c.pdf").write_bytes(make_pdf(["hello pdf"]))
-    on = make_store(tmp_path, FakeCaptioner())
-    on.index_project(1, root, ["a.png", "b.py", "c.pdf"])
-    return on
-
-
-def paths(s):
-    return {f["path"] for f in s.list_files(1)}
-
-
-def test_disabled_vision_prune_keeps_images_but_prunes_text_and_pdf(tmp_path, root):
-    _seed(tmp_path, root)
-    off = make_store(tmp_path, captioner=None, vision_model="")
-    stats = off.index_project(1, root, [])  # nothing listed: everything stale
-    assert stats["deleted"] == 2
-    assert paths(off) == {"a.png"}
-    assert off.query(1, "acme logo", 1)[0]["path"] == "a.png"
-
-
-def test_disabled_vision_sync_file_missing_image_keeps_rows_and_copy(tmp_path, root):
-    _seed(tmp_path, root)
-    (root / "a.png").unlink()
-    off = make_store(tmp_path, captioner=None, vision_model="")
-    assert off.sync_file(1, root, "a.png") == "missing"
-    assert paths(off) == {"a.png", "b.py", "c.pdf"}  # nothing was deleted
-    assert (off.files_dir / "1" / "a.png").exists()
-    assert off.query(1, "acme", 1)
-
-
-def test_disabled_vision_sync_file_image_present_is_still_not_deleted(tmp_path, root):
-    _seed(tmp_path, root)
-    off = make_store(tmp_path, captioner=None, vision_model="")
-    assert off.sync_file(1, root, "a.png") == "missing"  # not scannable, not dropped
-    assert "a.png" in paths(off)
-
-
-def test_disabled_vision_text_and_pdf_still_deleted_by_sync_file(tmp_path, root):
-    _seed(tmp_path, root)
-    (root / "b.py").unlink()
-    (root / "c.pdf").unlink()
-    off = make_store(tmp_path, captioner=None, vision_model="")
-    assert off.sync_file(1, root, "b.py") == "deleted"
-    assert off.sync_file(1, root, "c.pdf") == "deleted"
-    assert paths(off) == {"a.png"}
-
-
-def test_disabled_vision_uppercase_image_ext_also_kept(tmp_path, root):
-    (root / "A.PNG").write_bytes(PNG)
-    make_store(tmp_path, FakeCaptioner()).index_project(1, root, ["A.PNG"])
-    off = make_store(tmp_path, captioner=None, vision_model="")
-    assert off.index_project(1, root, [])["deleted"] == 0
-    assert paths(off) == {"A.PNG"}
-
-
-def test_reenabled_vision_prunes_truly_gone_image(tmp_path, root):
-    _seed(tmp_path, root)
-    (root / "a.png").unlink()
-    on = make_store(tmp_path, FakeCaptioner())
-    stats = on.index_project(1, root, ["b.py", "c.pdf"])
-    assert stats["deleted"] == 1
-    assert paths(on) == {"b.py", "c.pdf"}
-
-
-def test_reenabled_vision_sync_file_deletes_gone_image(tmp_path, root):
-    _seed(tmp_path, root)
-    (root / "a.png").unlink()
-    on = make_store(tmp_path, FakeCaptioner())
-    assert on.sync_file(1, root, "a.png") == "deleted"
-    assert "a.png" not in paths(on)
-
-
-def test_uploaded_image_unaffected_by_prune_in_either_mode(tmp_path, root):
-    on = make_store(tmp_path, FakeCaptioner())
-    assert on.put_file(1, "up.png", PNG, source="upload") == "captioned"
-    assert on.index_project(1, root, [])["deleted"] == 0
-    off = make_store(tmp_path, captioner=None, vision_model="")
-    assert off.index_project(1, root, [])["deleted"] == 0
-    assert off.sync_file(1, root, "up.png") == "missing"
-    assert paths(off) == {"up.png"}
-
-
-def test_keeps_is_false_for_non_images_and_when_vision_on(tmp_path):
-    off = make_store(tmp_path, captioner=None, vision_model="")
-    on = make_store(tmp_path, FakeCaptioner())
-    assert off._keeps("a.png") and off._keeps("dir/B.JPG")
-    assert not off._keeps("a.py") and not off._keeps("a.pdf")
-    assert not on._keeps("a.png")
 
 
 # ---- caption cap -------------------------------------------------------------
@@ -178,30 +79,10 @@ def test_caption_cap_keeps_head_of_caption(tmp_path):
 
 # ---- zero-byte images --------------------------------------------------------
 
-def test_zero_byte_image_via_scan_counts_skipped_and_no_vision_call(tmp_path, root):
-    (root / "e.png").write_bytes(b"")
-    cap = FakeCaptioner()
-    s = make_store(tmp_path, cap)
-    stats = s.index_project(1, root, ["e.png"])
-    assert stats["skipped"] == 1 and stats["indexed"] == 0 and stats["failed"] == 0
-    assert "skipped_image_failed" not in stats and "skipped_image_disabled" not in stats
-    assert cap.calls == 0
-    assert paths(s) == {"e.png"}  # recorded, so not retried
-    assert s.index_project(1, root, ["e.png"])["unchanged"] == 1
-    assert cap.calls == 0
-
-
-def test_zero_byte_image_via_sync_file_returns_skipped(tmp_path, root):
-    (root / "e.png").write_bytes(b"")
-    cap = FakeCaptioner()
-    assert make_store(tmp_path, cap).sync_file(1, root, "e.png") == "skipped"
-    assert cap.calls == 0
-
-
 def test_zero_byte_image_via_upload_skipped_no_copy(tmp_path):
     cap = FakeCaptioner()
     s = make_store(tmp_path, cap)
-    assert s.put_file(1, "e.png", b"", source="upload") == "skipped"
+    assert s.put_file(1, "e.png", b"") == "skipped"
     assert cap.calls == 0
     assert not (s.files_dir / "1" / "e.png").exists()
     assert s.query(1, "anything", 5) == []

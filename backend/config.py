@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import rag
-
 BASE = Path(__file__).resolve().parent.parent
 DB_PATH = BASE / "server.db"
 UPLOADS = BASE / "uploads"
@@ -12,16 +10,24 @@ UPLOADS.mkdir(exist_ok=True)
 OLLAMA = "http://localhost:11434"
 MODEL = "qwen2.5-coder:7b"
 
-# Which files are worth pulling into context (shared with the RAG scan filter).
-CODE_EXT, SKIP_DIRS = rag.CODE_EXT, rag.SKIP_DIRS
-MAX_CONTEXT_BYTES = 120_000  # keep the prompt inside the model's window
+# Session history window: the newest messages that fit this many characters
+# (plus always the latest message) go into the prompt. Older turns stay stored
+# and visible in the UI but are not sent. Keep it inside the model's context.
+MAX_HISTORY_CHARS = 24_000
 
-# RAG: per-project index of file chunks, retrieved per question at chat time.
+# RAG: per-project index of uploaded file chunks, shared by all the project's
+# sessions and retrieved per question at chat time.
 EMBED_MODEL = "nomic-embed-text"  # `ollama pull nomic-embed-text`
 RAG_TOP_K = 5
+RAG_MAX_EXCERPT_CHARS = 6_000  # total size of the excerpts injected per question
+# The retrieval query is the latest message plus a little recent conversation,
+# so follow-ups ("and the second one?") still find the right chunks.
+RAG_QUERY_HISTORY_CHARS = 400  # budget for earlier user turns in the query
+RAG_QUERY_MAX_CHARS = 2_000  # cap on the whole query text sent to the embedder
+MAX_UPLOAD_FILES = 20  # files accepted by one project upload request
+PROJECT_NAME_MAX = 100
 RAG_CHUNK_CHARS = 1500
 RAG_OVERLAP_CHARS = 200
-RAG_SCAN_LIMIT = 10_000
 EMBED_TIMEOUT = 120  # indexing: a cold model load can be slow
 QUERY_EMBED_TIMEOUT = 10  # chat: don't stall the user waiting on retrieval
 # Images are described by a vision model and the description is indexed.

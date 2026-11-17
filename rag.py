@@ -19,7 +19,7 @@ import logging
 import re
 import shutil
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
@@ -40,18 +40,8 @@ MAX_PDF_CHARS = 2_000_000  # extracted-text cap, against decompression bombs
 MAX_CAPTION_CHARS = 8000  # a rambling vision model can't create unbounded chunks
 EMBED_BATCH = 32
 
-# Files worth indexing from a project folder. Everything else is ignored.
-CODE_EXT = {
-    ".java", ".kt", ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs",
-    ".sql", ".xml", ".yaml", ".yml", ".json", ".properties", ".md",
-    ".sh", ".toml", ".gradle", ".html", ".css",
-}
 PDF_EXT = {".pdf"}
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
-SKIP_DIRS = {
-    ".git", "target", "build", "node_modules", ".idea", ".venv",
-    "venv", "__pycache__", "dist", ".gradle", "out",
-}
 # Windows device names are reserved in any directory, with or without extension.
 _RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"{n}{i}" for n in ("COM", "LPT") for i in range(1, 10))}
 
@@ -151,7 +141,7 @@ class OllamaCaptioner:
 # --------------------------------------------------------------------------
 
 def clean_relpath(rel: str) -> str:
-    """Normalise a project-relative path; reject anything that isn't a plain one.
+    """Normalise a project-relative file name; reject anything that isn't a plain one.
 
     Besides absolute and ``..`` paths this rejects what is special on Windows:
     drive letters and NTFS streams (any ``:``), reserved device names, and
@@ -170,13 +160,6 @@ def file_kind(rel: str) -> str:
     """'pdf', 'image' or 'text' (anything else is tried as text), by extension."""
     suffix = PurePosixPath(rel).suffix.lower()
     return "pdf" if suffix in PDF_EXT else "image" if suffix in IMAGE_EXT else "text"
-
-
-def is_scannable(rel: str, images: bool = True) -> bool:
-    """True if a project-relative path is one the folder scan would index."""
-    p = PurePosixPath(rel)
-    exts = CODE_EXT | PDF_EXT | (IMAGE_EXT if images else set())
-    return p.suffix.lower() in exts and not any(part in SKIP_DIRS for part in p.parts)
 
 
 def decode_text(data: bytes) -> str | None:
@@ -276,7 +259,7 @@ class RagStore:
         max_pdf_pages: int = MAX_PDF_PAGES,
     ):
         self.db_path, self.files_dir = Path(db_path), Path(files_dir)
-        # no captioner means images are not supported (and not scanned)
+        # no captioner means images are not supported (they are skipped on upload)
         self.captioner, self.vision_model = captioner, vision_model
         self.max_pdf_bytes, self.max_image_bytes = max_pdf_bytes, max_image_bytes
         self.max_pdf_pages = max_pdf_pages
@@ -291,7 +274,7 @@ class RagStore:
                     project_id INTEGER NOT NULL,
                     path       TEXT NOT NULL,
                     sig        TEXT NOT NULL,
-                    source     TEXT NOT NULL,   -- 'scan' (project folder) or 'upload'
+                    source     TEXT NOT NULL,   -- legacy: always 'upload' now ('scan' in old indexes)
                     PRIMARY KEY (project_id, path)
                 );
                 CREATE TABLE IF NOT EXISTS rag_chunks (
@@ -323,9 +306,6 @@ class RagStore:
         if not copy.is_relative_to(base) or copy == base:
             raise ValueError(f"invalid path: {rel!r}")
         return copy
-
-    def scannable(self, rel: str) -> bool:
-        return is_scannable(rel, images=self.captioner is not None)
 
     def max_bytes(self, rel: str) -> int:
         """Largest file accepted for this path's type."""
@@ -378,12 +358,11 @@ class RagStore:
         norms = np.linalg.norm(m, axis=1, keepdims=True)
         return m / np.where(norms == 0, 1, norms)
 
-    def put_file(self, project_id: int, rel: str, data: bytes, source: str = "scan") -> str:
+    def put_file(self, project_id: int, rel: str, data: bytes) -> str:
         """Chunk, embed and store one file, plus a local copy of it.
 
         Returns 'indexed' ('captioned' for an image), 'unchanged' (same content
-        already indexed), 'shadowed' (a scan may not replace an uploaded file)
-        or a 'skipped...' result ('skipped_pdf_no_text', 'skipped_pdf_unreadable',
+        already indexed) or a 'skipped...' result ('skipped_pdf_no_text', 'skipped_pdf_unreadable',
         'skipped_image_failed', 'skipped_image_disabled', or plain 'skipped'). A skip for a file that
         will never yield text (binary, too large, empty, PDF without text)
         drops any old chunks and copy; a skip that may be transient (the vision
@@ -398,11 +377,8 @@ class RagStore:
             sig += f":{self.vision_model}"  # a new vision model re-captions
         with self._db() as c:
             row = c.execute(
-                "SELECT sig, source FROM rag_files WHERE project_id=? AND path=?",
-                (project_id, rel),
+                "SELECT sig FROM rag_files WHERE project_id=? AND path=?", (project_id, rel)
             ).fetchone()
-        if row and row[1] == "upload" and source == "scan":
-            return "shadowed"
         if row and row[0] == sig:
             return "unchanged"
 
@@ -432,16 +408,9 @@ class RagStore:
             )
             c.execute(
                 "INSERT OR REPLACE INTO rag_files (project_id, path, sig, source) VALUES (?,?,?,?)",
-                (project_id, rel, sig, source),
+                (project_id, rel, sig, "upload"),
             )
         return result
-
-    def _source(self, project_id: int, rel: str) -> str | None:
-        with self._db() as c:
-            row = c.execute(
-                "SELECT source FROM rag_files WHERE project_id=? AND path=?", (project_id, rel)
-            ).fetchone()
-        return row[0] if row else None
 
     def delete_file(self, project_id: int, rel: str) -> bool:
         """Drop a file's chunks, index row and local copy. True if it was known.
@@ -465,74 +434,6 @@ class RagStore:
             c.execute("DELETE FROM rag_files WHERE project_id=?", (project_id,))
         shutil.rmtree(self.files_dir / str(project_id), ignore_errors=True)
 
-    def _keeps(self, rel: str) -> bool:
-        """True for image paths while vision is disabled: their existing
-        captions stay searchable and are never pruned or deleted."""
-        return self.captioner is None and file_kind(rel) == "image"
-
-    def sync_file(self, project_id: int, root: Path, rel: str) -> str:
-        """Bring one scanned file in line with disk: re-index if present, else delete.
-
-        Applies the folder scan's filters (extensions, skipped dirs) and
-        refuses files that resolve outside ``root``.
-        """
-        rel = clean_relpath(rel)
-        src = (root / rel).resolve()
-        if not self.scannable(rel) or root.resolve() not in src.parents or not src.is_file():
-            if self._keeps(rel):
-                return "missing"
-            if self._source(project_id, rel) == "scan":
-                self.delete_file(project_id, rel)
-                return "deleted"
-            return "missing"  # unknown, or an upload (has no source on disk)
-        if src.stat().st_size > self.max_bytes(rel):  # don't read it just to drop it
-            if self._source(project_id, rel) == "scan":
-                self.delete_file(project_id, rel)
-            return "skipped"
-        return self.put_file(project_id, rel, src.read_bytes())
-
-    def index_project(
-        self, project_id: int, root: Path, rels: Iterable[str], prune: bool = True
-    ) -> dict:
-        """Incrementally sync ``rels`` from ``root``.
-
-        With ``prune``, scanned files not in ``rels`` are dropped as vanished;
-        pass False when ``rels`` may be incomplete (e.g. the scan hit its cap).
-        Uploaded files are never treated as stale. If Ollama can't be reached,
-        stops at once and reports ``aborted`` instead of retrying every file.
-        ``skipped`` and ``indexed`` are totals; the specific outcomes
-        ('skipped_pdf_no_text', 'captioned', ...) appear as extra keys when
-        they occur.
-        """
-        stats = {"indexed": 0, "unchanged": 0, "skipped": 0, "shadowed": 0,
-                 "deleted": 0, "missing": 0, "failed": 0}
-        seen = set()
-        for rel in rels:
-            seen.add(rel)
-            try:
-                result = self.sync_file(project_id, root, rel)
-                stats[result] = stats.get(result, 0) + 1
-                if result.startswith("skipped_"):
-                    stats["skipped"] += 1
-                elif result == "captioned":
-                    stats["indexed"] += 1
-            except httpx.TransportError as e:
-                stats["failed"] += 1
-                stats["aborted"] = f"Ollama unreachable: {e!r}"
-                return stats
-            except (OSError, ValueError, httpx.HTTPError, KeyError):
-                stats["failed"] += 1
-        if prune:
-            with self._db() as c:
-                known = [r[0] for r in c.execute(
-                    "SELECT path FROM rag_files WHERE project_id=? AND source='scan'", (project_id,)
-                )]
-            for rel in known:
-                if rel not in seen and not self._keeps(rel):
-                    self.delete_file(project_id, rel)
-                    stats["deleted"] += 1
-        return stats
-
     # ---- reads -----------------------------------------------------------
 
     def has_index(self, project_id: int) -> bool:
@@ -544,12 +445,12 @@ class RagStore:
     def list_files(self, project_id: int) -> list[dict]:
         with self._db() as c:
             rows = c.execute(
-                "SELECT f.path, f.source, COUNT(k.id) FROM rag_files f "
+                "SELECT f.path, COUNT(k.id) FROM rag_files f "
                 "LEFT JOIN rag_chunks k ON k.project_id=f.project_id AND k.path=f.path "
                 "WHERE f.project_id=? GROUP BY f.path ORDER BY f.path",
                 (project_id,),
             ).fetchall()
-        return [{"path": p, "source": s, "chunks": n} for p, s, n in rows]
+        return [{"path": p, "chunks": n} for p, n in rows]
 
     def query(self, project_id: int, text: str, k: int = 5) -> list[dict]:
         """Top-k chunks by cosine similarity, best first.
@@ -584,6 +485,22 @@ class RagStore:
 
 # untrusted chunk text must not be able to close (or reopen) the <excerpts> block
 _DELIMITER = re.compile(r"<(/?)excerpts", re.I)
+
+
+def fit_hits(hits: list[dict], max_chars: int) -> list[dict]:
+    """The leading hits whose text fits ``max_chars`` in total (best first).
+
+    The best hit is always kept, cut to the budget if it alone is too big, so
+    a small budget never silently turns retrieval off.
+    """
+    out, total = [], 0
+    for h in hits:
+        room = max_chars - total
+        if out and len(h["text"]) > room:
+            break
+        out.append(h if len(h["text"]) <= room else {**h, "text": h["text"][:max(room, 0)]})
+        total += len(out[-1]["text"])
+    return out
 
 
 def format_hits(hits: list[dict]) -> str:

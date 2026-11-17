@@ -1,4 +1,4 @@
-"""Chat: prompt assembly (pinned files + RAG excerpts) and the streamed Ollama reply."""
+"""Chat: prompt assembly (project RAG excerpts + windowed history) and the streamed Ollama reply."""
 
 import json
 import sqlite3
@@ -12,11 +12,13 @@ from pydantic import BaseModel
 
 import rag
 from backend import rag_store
-from backend.config import MAX_CONTEXT_BYTES, MODEL, OLLAMA, RAG_TOP_K
+from backend.config import MODEL, OLLAMA, RAG_MAX_EXCERPT_CHARS, RAG_TOP_K
 from backend.database import db
-from backend.routes.projects import project_root
+from backend.prompt import build_retrieval_query, fit_history
 
 router = APIRouter()
+
+SOURCES_HEADER = "X-RAG-Sources"  # JSON list of the file names used for this answer
 
 
 class ChatIn(BaseModel):
@@ -24,60 +26,35 @@ class ChatIn(BaseModel):
     content: str
 
 
-def build_context_block(project_id: int | None, files: list[str]) -> str:
-    if not project_id or not files:
-        return ""
-    root = project_root(project_id)
-    parts, total = [], 0
-    for rel in files:
-        if rag.file_kind(rel) != "text":
-            continue  # never inject raw PDF/image bytes; those are reachable via RAG
-        f = (root / rel).resolve()
-        # refuse anything that escapes the project root
-        if root.resolve() not in f.parents and f != root.resolve():
-            continue
-        if not f.is_file():
-            continue
-        try:
-            text = f.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        if total + len(text) > MAX_CONTEXT_BYTES:
-            text = text[: max(0, MAX_CONTEXT_BYTES - total)]
-        total += len(text)
-        parts.append(f"--- {rel} ---\n{text}")
-        if total >= MAX_CONTEXT_BYTES:
-            break
-    if not parts:
-        return ""
-    return (
-        "You are helping with the following codebase. Use these files as the "
-        "source of truth; say so if something is not in them.\n\n"
-        + "\n\n".join(parts)
-    )
+async def retrieve_hits(project_id: int | None, query: str) -> list[dict]:
+    """The excerpts that go into the prompt (best first, within the size budget).
 
-
-async def retrieve_context(project_id: int | None, question: str) -> str:
-    """RAG excerpts for the question, or '' if there is no index or retrieval fails.
-
-    Retrieval is best-effort: no failure here (embedder down, stale index,
+    Empty for a normal chat, a project with no index, or any retrieval failure:
+    retrieval is best-effort, and no failure here (embedder down, stale index,
     database trouble) may break plain chat.
     """
     if not project_id:
-        return ""
+        return []
     try:
         if not await run_in_threadpool(rag_store.store.has_index, project_id):
-            return ""
-        hits = await run_in_threadpool(rag_store.store.query, project_id, question, RAG_TOP_K)
+            return []
+        hits = await run_in_threadpool(rag_store.store.query, project_id, query, RAG_TOP_K)
     except (sqlite3.Error, OSError, httpx.HTTPError, ValueError, KeyError, rag.ReindexRequired):
-        return ""
-    return rag.format_hits(hits)
+        return []
+    return rag.fit_hits(hits, RAG_MAX_EXCERPT_CHARS)
+
+
+async def retrieve_context(project_id: int | None, query: str) -> str:
+    """``retrieve_hits`` rendered as a system-message block ('' if none)."""
+    return rag.format_hits(await retrieve_hits(project_id, query))
 
 
 @router.post("/api/chat")
 async def chat(body: ChatIn):
     with db() as c:
-        s = c.execute("SELECT * FROM sessions WHERE id = ?", (body.session_id,)).fetchone()
+        s = c.execute(
+            "SELECT id, project_id FROM sessions WHERE id = ?", (body.session_id,)
+        ).fetchone()
         if not s:
             raise HTTPException(404, "no such session")
         history = [
@@ -99,14 +76,12 @@ async def chat(body: ChatIn):
             )
 
     messages = []
-    ctx = build_context_block(s["project_id"], json.loads(s["context"]))
-    if ctx:
-        messages.append({"role": "system", "content": ctx})
-    hits = await retrieve_context(s["project_id"], body.content)
+    # Project knowledge comes from retrieval, not from the session's window.
+    hits = await retrieve_hits(s["project_id"], build_retrieval_query(history, body.content))
     if hits:
-        messages.append({"role": "system", "content": hits})
-    messages.extend(history)
-    messages.append({"role": "user", "content": body.content})
+        messages.append({"role": "system", "content": rag.format_hits(hits)})
+    messages.extend(fit_history([*history, {"role": "user", "content": body.content}]))
+    sources = list(dict.fromkeys(h["path"] for h in hits))
 
     async def stream():
         collected = []
@@ -131,13 +106,18 @@ async def chat(body: ChatIn):
         finally:
             if collected:
                 with db() as c:
+                    # the session may have been deleted while the reply streamed
                     c.execute(
                         "INSERT INTO messages (session_id, role, content, created_at) "
-                        "VALUES (?,?,?,?)",
-                        (body.session_id, "assistant", "".join(collected), time.time()),
+                        "SELECT ?,?,?,? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)",
+                        (body.session_id, "assistant", "".join(collected), time.time(),
+                         body.session_id),
                     )
 
-    return StreamingResponse(stream(), media_type="text/plain")
+    # json.dumps escapes non-ASCII, so the value is a valid header whatever the file names
+    return StreamingResponse(
+        stream(), media_type="text/plain", headers={SOURCES_HEADER: json.dumps(sources)}
+    )
 
 
 @router.get("/api/health")

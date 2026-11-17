@@ -1,6 +1,6 @@
 const $ = (id) => document.getElementById(id);
 const log = $('log'), q = $('q');
-let modelName = '', sid = null, session = null, projects = [], ctxSelected = new Set(), idxPid = null, busy = false;
+let modelName = '', sid = null, session = null, curProject = null, projects = [], busy = false;
 
 /* ---------- helpers ---------- */
 // Build DOM without innerHTML so names/paths/model output can never inject markup.
@@ -21,6 +21,14 @@ function toast(msg, kind = 'error') {
   setTimeout(() => t.remove(), kind === 'error' ? 8000 : 4000);
 }
 
+// Readable explanations for the statuses a failed upload or chat can come back with.
+const HINTS = {
+  413: 'Upload too large.',
+  409: 'The project index was built with another embedding model: upload the files again.',
+  502: 'Ollama did not answer properly. Is it running, and are the models pulled?',
+  400: 'Invalid request.',
+};
+
 // Turn a failed response into a readable message (FastAPI sends {"detail": ...}).
 async function errorText(r) {
   let detail = '';
@@ -28,12 +36,7 @@ async function errorText(r) {
     const j = await r.json();
     detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail || j);
   } catch (e) { /* not JSON */ }
-  const hint = {
-    413: 'File too large for its type.',
-    409: 'The index was built with another embedding model: run "Index project" again.',
-    502: 'Ollama did not answer properly. Is it running, and are the models pulled?',
-    400: 'Invalid request.',
-  }[r.status];
+  const hint = HINTS[r.status];
   return [hint, detail].filter(Boolean).join(' ') || `HTTP ${r.status}`;
 }
 
@@ -139,7 +142,7 @@ log.addEventListener('click', async (e) => {
   setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
 });
 
-/* ---------- sessions ---------- */
+/* ---------- navigation ---------- */
 function toggleNav(open) {
   document.body.classList.toggle('nav-open', open);
   if (open) $('side').querySelector('button, a[href], input, select, textarea')?.focus();
@@ -149,29 +152,51 @@ $('menuBtn').onclick = () => toggleNav(true);
 $('scrim').onclick = () => toggleNav(false);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') toggleNav(false); });
 
-const loadSessions = guard(async () => {
-  const rows = await api('/api/sessions');
-  const box = $('sessions');
+// Exactly one of the two views is visible: a project workspace or a conversation.
+function showView(name) {
+  $('projectView').hidden = name !== 'project';
+  $('chatView').hidden = name !== 'chat';
+}
+
+const activeProjectId = () => {
+  if (!$('projectView').hidden && curProject) return curProject.id;
+  return session ? session.project_id : null;
+};
+
+const refreshLists = () => { loadSessions(); loadProjects(); refreshProject(); };
+
+/* ---------- chats ---------- */
+// Render a list of chat rows (normal chats in the sidebar, or a project's chats).
+function sessionList(box, rows, emptyText) {
   box.replaceChildren();
-  if (!rows.length) box.append(el('div', {class: 'muted', style: 'padding:8px 10px'}, 'No chats yet.'));
+  if (!rows.length) box.append(el('div', {class: 'muted', style: 'padding:8px 10px'}, emptyText));
   rows.forEach((s) => {
     const del = async () => {
-      if (!confirm('Delete this session?')) return;
+      if (!confirm('Delete this chat?')) return;
       try { await request('/api/sessions/' + s.id, {method: 'DELETE'}); }
       catch (e) { toast(e.message); return; }
-      if (sid === s.id) { sid = null; session = null; render(); }
-      loadSessions();
+      if (sid === s.id) {
+        sid = null; session = null; render();
+        if (s.project_id) { openProject(s.project_id); return; }
+      }
+      refreshLists();
     };
     const open = el('button', {class: 'open', type: 'button', onclick: () => openSession(s.id)}, s.title);
     if (s.id === sid) open.setAttribute('aria-current', 'true');
-    const item = el('div', {class: 'item' + (s.id === sid ? ' active' : ''), oncontextmenu: (e) => { e.preventDefault(); del(); }},
-      open, el('button', {class: 'icon del danger', type: 'button', 'aria-label': 'Delete ' + s.title, title: 'Delete', onclick: del}, '✕'));
-    box.appendChild(item);
+    box.appendChild(el('div', {class: 'item' + (s.id === sid ? ' active' : ''), oncontextmenu: (e) => { e.preventDefault(); del(); }},
+      open, el('button', {class: 'icon del danger', type: 'button', 'aria-label': 'Delete ' + s.title, title: 'Delete', onclick: del}, '✕')));
   });
+}
+
+const loadSessions = guard(async () => {
+  sessionList($('sessions'), await api('/api/sessions'), 'No chats yet.');
 });
 
-const newSession = guard(async () => {
-  const r = await api('/api/sessions', json('POST', {title: 'New chat'}));
+// A chat inside a project when projectId is given, else a normal chat.
+const newSession = guard(async (projectId) => {
+  const r = projectId
+    ? await api(`/api/projects/${projectId}/sessions`, json('POST', {title: 'New chat'}))
+    : await api('/api/sessions', json('POST', {title: 'New chat'}));
   await openSession(r.id);
 });
 
@@ -179,17 +204,21 @@ const openSession = guard(async (id) => {
   sid = id;
   session = await api('/api/sessions/' + id);
   render();
-  loadSessions();
+  refreshLists();
   toggleNav(false);
 });
 
 function render() {
+  showView('chat');
   log.replaceChildren($('empty'));
-  $('title').textContent = session ? session.title : 'No session';
-  const proj = session && session.project_id
-    ? 'Project: ' + ((projects.find((p) => p.id === session.project_id) || {}).name || '#' + session.project_id) : '';
-  $('sub').textContent = [modelName, proj].filter(Boolean).join(' \u00b7 ');
-  $('chips').replaceChildren(...((session && session.context) || []).map((f) => el('span', {class: 'chip'}, f)));
+  $('title').textContent = session ? session.title : 'New chat';
+  $('sub').textContent = modelName;
+  const inProject = !!(session && session.project_id);
+  $('projLink').hidden = !inProject;
+  if (inProject) $('projLink').textContent = '← ' + (session.project_name || 'Project');
+  $('emptyText').textContent = inProject
+    ? 'This chat shares the files uploaded to its project. Relevant parts are retrieved for every question.'
+    : 'Chats stay on this machine. Create a project to ground answers in your own files, PDFs and images.';
   if (session) session.messages.forEach((m) => bubble(m.role === 'user' ? 'user' : 'bot', m.content));
   $('empty').hidden = !!(session && session.messages.length);
 }
@@ -234,9 +263,22 @@ $('ask').onsubmit = async (e) => {
     busy = false;
     $('send').disabled = false;
     q.focus();
-    loadSessions();
+    refreshLists();
   }
 };
+
+// The server names the project files it retrieved from in a response header.
+function sourcesFrom(res) {
+  try {
+    const v = JSON.parse(res.headers.get('X-RAG-Sources') || '[]');
+    return Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [];
+  } catch (e) { return []; }
+}
+
+function showSources(after, names) {
+  if (!names.length) return;
+  after.after(el('div', {class: 'sources', title: names.join(', ')}, 'Used project files: ' + names.join(', ')));
+}
 
 async function stream(text) {
   const out = bubble('bot', '');
@@ -250,6 +292,7 @@ async function stream(text) {
   try {
     const res = await fetch('/api/chat', json('POST', {session_id: sid, content: text}));
     if (!res.ok) throw new Error(await errorText(res));
+    const sources = sourcesFrom(res);
     const reader = res.body.getReader(), dec = new TextDecoder();
     while (true) {
       const {done, value} = await reader.read();
@@ -259,6 +302,7 @@ async function stream(text) {
     }
     paint();
     if (!full.trim()) throw new Error('Empty reply.');
+    showSources(out, sources);
   } catch (err) {
     const down = !full && (err instanceof TypeError || err.message === 'Empty reply.');
     const msg = down ? 'No reply. Ollama may not be running (or the model is not pulled).' : err.message;
@@ -272,15 +316,10 @@ document.querySelectorAll('dialog').forEach((d) => {
   d.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => d.close()));
   d.addEventListener('click', (e) => { if (e.target === d) d.close(); });  // backdrop click
 });
-$('newBtn').onclick = newSession;
+$('newBtn').onclick = () => newSession();
 $('filesBtn').onclick = () => { $('filesDlg').showModal(); loadFiles(); };
-// arrows: these handlers are declared further down (const, so not yet initialised here)
-$('projBtn').onclick = () => openProjects();
-$('ctxBtn').onclick = () => openContext();
-$('addProj').onclick = () => addProject();
-$('saveCtx').onclick = () => saveContext();
 
-/* ---------- file transfer ---------- */
+/* ---------- file transfer (general, to ./uploads) ---------- */
 function fmtSize(n) {
   return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
 }
@@ -296,6 +335,7 @@ const loadFiles = guard(async () => {
       el('span', {class: 'muted'}, fmtSize(f.size)),
       el('button', {class: 'ghost', 'aria-label': 'Download ' + f.name, onclick: () => { location.href = '/api/files/' + encodeURIComponent(f.name); }}, '↓'),
       el('button', {class: 'ghost danger', 'aria-label': 'Delete ' + f.name, onclick: guard(async () => {
+        if (!confirm(`Delete "${f.name}"?`)) return;
         await request('/api/files/' + encodeURIComponent(f.name), {method: 'DELETE'});
         loadFiles();
       })}, '✕')));
@@ -313,37 +353,98 @@ $('upInput').onchange = async (e) => {
 };
 
 /* ---------- projects ---------- */
-const openProjects = guard(async () => {
+const loadProjects = guard(async () => {
   projects = await api('/api/projects');
-  const box = $('projList');
+  const box = $('projects');
   box.replaceChildren();
-  if (!projects.length) box.append(el('div', {class: 'muted'}, 'No projects yet.'));
+  if (!projects.length) box.append(el('div', {class: 'muted', style: 'padding:8px 10px'}, 'No projects yet.'));
+  const current = activeProjectId();
   projects.forEach((p) => {
-    box.append(el('div', {class: 'line'},
-      el('span', {class: 'grow', title: p.path}, p.name, el('br'), el('span', {class: 'muted'}, p.path)),
-      el('button', {class: 'ghost', onclick: () => openIndex(p)}, 'Index'),
-      el('button', {class: 'ghost danger', 'aria-label': 'Delete project ' + p.name, onclick: guard(async () => {
-        if (!confirm(`Remove project "${p.name}" and its index?`)) return;
-        await request('/api/projects/' + p.id, {method: 'DELETE'});
-        openProjects();
-      })}, '✕')));
+    const open = el('button', {class: 'open', type: 'button', onclick: () => openProject(p.id)}, p.name);
+    if (p.id === current) open.setAttribute('aria-current', 'true');
+    box.appendChild(el('div', {class: 'item' + (p.id === current ? ' active' : '')}, open));
   });
-  if (!$('projDlg').open) $('projDlg').showModal();
 });
 
-const addProject = guard(async () => {
-  await api('/api/projects', json('POST', {name: $('projName').value, path: $('projPath').value}));
-  $('projName').value = ''; $('projPath').value = '';
-  openProjects();
+const openProject = guard(async (id) => {
+  curProject = await api('/api/projects/' + id);
+  sid = null; session = null;
+  paintProject();
+  $('upResult').replaceChildren();
+  $('upResult').hidden = true;
+  loadSessions();
+  loadProjects();
+  toggleNav(false);
 });
 
-/* ---------- project index (RAG) ---------- */
-const OUTCOMES = {
-  indexed: 'indexed', captioned: 'images described', unchanged: 'unchanged', skipped: 'skipped',
-  skipped_pdf_no_text: 'PDFs without text layer', skipped_pdf_unreadable: 'PDFs encrypted/corrupt',
-  skipped_image_failed: 'images the vision model failed on', skipped_image_disabled: 'images (vision off)',
-  shadowed: 'kept uploaded version', deleted: 'removed (gone from disk)', missing: 'missing', failed: 'failed',
-};
+// Re-read the open project (after an upload, delete or chat) without changing views.
+const refreshProject = guard(async () => {
+  if (!curProject || $('projectView').hidden) return;
+  curProject = await api('/api/projects/' + curProject.id);
+  paintProject();
+});
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+function paintProject() {
+  const p = curProject;
+  showView('project');
+  $('title').textContent = p.name;
+  $('sub').textContent = ['Project', plural(p.sessions.length, 'chat'), plural(p.files.length, 'file')].join(' \u00b7 ');
+  $('projLink').hidden = true;
+  $('projName').textContent = p.name;
+  sessionList($('projSessions'), p.sessions, 'No chats in this project yet.');
+  paintProjectFiles(p.files);
+}
+
+function paintProjectFiles(files) {
+  const box = $('projFiles');
+  box.replaceChildren();
+  if (!files.length) { box.append(el('div', {class: 'muted'}, 'No files yet. Upload some and every chat in this project can use them.')); return; }
+  files.forEach((f) => {
+    box.append(el('div', {class: 'line'},
+      el('span', {class: 'grow', title: f.path}, f.path),
+      el('span', {class: 'badge' + (f.chunks ? ' ok' : ' warn')}, f.chunks ? plural(f.chunks, 'chunk') : 'no text'),
+      el('button', {class: 'ghost danger', 'aria-label': 'Delete ' + f.path, title: 'Delete file', onclick: () => deleteProjectFile(f.path)}, '✕')));
+  });
+}
+
+const deleteProjectFile = guard(async (path) => {
+  if (!confirm(`Delete "${path}" from this project? Its indexed content is removed too.`)) return;
+  await request(`/api/projects/${curProject.id}/files?path=${encodeURIComponent(path)}`, {method: 'DELETE'});
+  refreshProject();
+});
+
+$('projNewChat').onclick = () => { if (curProject) newSession(curProject.id); };
+$('projLink').onclick = () => { if (session && session.project_id) openProject(session.project_id); };
+
+$('projDelBtn').onclick = guard(async () => {
+  const p = curProject;
+  if (!p) return;
+  const msg = `Delete project "${p.name}"?\n\nThis permanently deletes its ${plural(p.sessions.length, 'chat')} with all messages `
+    + `and its ${plural(p.files.length, 'indexed file')}. This cannot be undone.`;
+  if (!confirm(msg)) return;
+  await request('/api/projects/' + p.id, {method: 'DELETE'});
+  curProject = null; sid = null; session = null;
+  render();
+  refreshLists();
+  toast('Project deleted.', 'ok');
+});
+
+const createProject = guard(async () => {
+  const name = $('projNameInput').value.trim();
+  if (!name) { toast('Give the project a name.'); return; }
+  const r = await api('/api/projects', json('POST', {name}));
+  $('newProjDlg').close();
+  await openProject(r.id);
+});
+$('newProjBtn').onclick = () => { $('projNameInput').value = ''; $('newProjDlg').showModal(); $('projNameInput').focus(); };
+$('createProj').onclick = () => createProject();
+$('projNameInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); createProject(); }
+});
+
+/* ---------- project files: upload and indexing ---------- */
 const RESULT_TEXT = {
   indexed: 'Indexed.', captioned: 'Image described and indexed.', unchanged: 'Already up to date.',
   skipped: 'Skipped: empty, binary or too large.',
@@ -351,155 +452,67 @@ const RESULT_TEXT = {
   skipped_pdf_unreadable: 'Skipped: this PDF is encrypted or corrupt.',
   skipped_image_failed: 'Skipped: the vision model could not describe the image (is it pulled?).',
   skipped_image_disabled: 'Skipped: image support is off (VISION_MODEL is empty).',
-  shadowed: 'Not replaced: an uploaded file uses this path.', deleted: 'Removed from the index.', missing: 'Not found.',
 };
 
-function showResult(title, lines, bad = false) {
-  const box = $('idxResult');
-  box.hidden = false;
-  box.className = 'result' + (bad ? ' bad' : '');
-  box.replaceChildren(el('b', {}, title), el('ul', {}, ...lines.map((l) => el('li', {}, l))));
-}
-
-function openIndex(p) {
-  idxPid = p.id;
-  $('idxH').textContent = 'Index: ' + p.name;
-  $('idxResult').hidden = true;
-  loadIndex();
-  $('idxDlg').showModal();
-}
-
-const loadIndex = guard(async () => {
-  const rows = await api(`/api/projects/${idxPid}/index`);
-  const box = $('idxFiles');
-  box.replaceChildren();
-  if (!rows.length) { box.append(el('div', {class: 'muted'}, 'Nothing indexed yet. Click "Index project" or add files.')); return; }
-  rows.forEach((f) => {
-    box.append(el('div', {class: 'line'},
-      el('span', {class: 'grow', title: f.path}, f.path),
-      el('span', {class: 'badge' + (f.chunks ? ' ok' : ' warn')}, f.chunks ? `${f.chunks} chunk${f.chunks > 1 ? 's' : ''}` : 'no text'),
-      f.source === 'upload' ? el('span', {class: 'badge'}, 'upload') : '',
-      f.source === 'scan' ? el('button', {class: 'ghost', 'aria-label': 'Re-sync ' + f.path, title: 'Re-sync from disk', onclick: () => resync(f.path)}, '↻') : '',
-      el('button', {class: 'ghost danger', 'aria-label': 'Remove ' + f.path + ' from index', title: 'Remove from index', onclick: () => unindex(f.path)}, '✕')));
-  });
-});
-
-const resync = guard(async (path) => {
-  const r = await api(`/api/projects/${idxPid}/index/file?path=${encodeURIComponent(path)}`, {method: 'POST'});
-  toast(`${path}: ${RESULT_TEXT[r.result] || r.result}`, r.result.startsWith('skipped') ? 'error' : 'ok');
-  loadIndex();
-});
-
-const unindex = guard(async (path) => {
-  await request(`/api/projects/${idxPid}/index/file?path=${encodeURIComponent(path)}`, {method: 'DELETE'});
-  loadIndex();
-});
-
-$('indexBtn').onclick = async () => {
-  const btn = $('indexBtn');
-  btn.disabled = true;
-  btn.textContent = 'Indexing…';
-  showResult('Indexing…', ['Large PDFs and images (described by a vision model) can take a while.']);
-  try {
-    const s = await api(`/api/projects/${idxPid}/index`, {method: 'POST'});
-    const lines = Object.entries(s).filter(([k, v]) => v && OUTCOMES[k]).map(([k, v]) => `${v} ${OUTCOMES[k]}`);
-    showResult(s.failed ? 'Finished with errors' : 'Done', lines.length ? lines : ['Nothing to index.'], !!s.failed);
-  } catch (e) {
-    showResult('Indexing stopped', [e.message], true);
-    toast(e.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Index project';
-    loadIndex();
+// {tone, text} for one entry of the upload response ({path, result, status?, detail?}).
+function resultInfo(x) {
+  if (x.result === 'error') {
+    const hint = x.status === 413 ? '' : HINTS[x.status];
+    return {tone: 'bad', text: [hint, x.detail].filter(Boolean).join(' ') || `Error ${x.status}`};
   }
-};
+  return {tone: x.result.startsWith('skipped') ? 'warn' : 'ok', text: RESULT_TEXT[x.result] || x.result};
+}
 
-$('projUpload').onchange = async (e) => {
-  const files = [...e.target.files];
-  e.target.value = '';
-  const lines = [];
-  let bad = false;
-  showResult('Uploading…', [`${files.length} file(s)`]);
+function setUploadRow(row, tone, text) {
+  const badge = row.querySelector('.badge');
+  badge.className = 'badge ' + tone;
+  badge.textContent = {ok: 'done', warn: 'skipped', bad: 'failed', wait: 'indexing…'}[tone];
+  row.querySelector('.note').textContent = text;
+}
+
+// One request per file, so each file shows its own progress and outcome
+// (a large PDF or an image described by a vision model can take a while).
+async function uploadFiles(fileList) {
+  const files = [...fileList];
+  if (!files.length || !curProject) return;
+  const pid = curProject.id;
+  const box = $('upResult');
+  box.hidden = false;
+  box.replaceChildren();
   for (const f of files) {
+    const row = el('div', {class: 'line wrap'},
+      el('span', {class: 'grow', title: f.name}, f.name), el('span', {class: 'badge'}), el('span', {class: 'note'}));
+    box.append(row);
+    setUploadRow(row, 'wait', 'Uploading and indexing...');
     const fd = new FormData();
-    fd.append('file', f);
+    fd.append('files', f);
     try {
-      const r = await api(`/api/projects/${idxPid}/upload`, {method: 'POST', body: fd});
-      lines.push(`${f.name}: ${RESULT_TEXT[r.result] || r.result}`);
-      bad = bad || r.result.startsWith('skipped');
+      const r = await api(`/api/projects/${pid}/files`, {method: 'POST', body: fd});
+      const info = resultInfo(r.results[0]);
+      setUploadRow(row, info.tone, info.text);
     } catch (err) {
-      lines.push(`${f.name}: ${err.message}`);
-      bad = true;
+      setUploadRow(row, 'bad', err.message);
     }
   }
-  showResult(bad ? 'Uploaded, with problems' : 'Uploaded', lines, bad);
-  loadIndex();
+  if (curProject && curProject.id === pid) refreshProject();
+}
+
+$('projUpload').onchange = (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  uploadFiles(files);
 };
 
-/* ---------- context ---------- */
-const openContext = guard(async () => {
-  if (!sid) { toast('Open or start a chat first.', 'ok'); return; }
-  projects = await api('/api/projects');
-  const sel = $('ctxProject');
-  sel.replaceChildren(el('option', {value: ''}, 'No project'));
-  projects.forEach((p) => {
-    const o = el('option', {value: p.id}, p.name);
-    if (p.id === session.project_id) o.selected = true;
-    sel.appendChild(o);
-  });
-  ctxSelected = new Set(session.context || []);
-  await loadProjectFiles();
-  $('ctxDlg').showModal();
-});
-
-$('ctxProject').onchange = () => {
-  ctxSelected = new Set();   // paths belong to the old project, drop them
-  loadProjectFiles();
-};
-$('ctxFilter').oninput = () => loadProjectFiles();
-
-const loadProjectFiles = guard(async () => {
-  const pid = $('ctxProject').value;
-  if (!pid) { $('ctxFiles').replaceChildren(el('div', {class: 'muted'}, 'Pick a project.')); updateCtxCount(); return; }
-  paintFiles(await api(`/api/projects/${pid}/files?q=${encodeURIComponent($('ctxFilter').value)}`));
-});
-
-$('ctxGrep').onkeydown = guard(async (e) => {
-  if (e.key !== 'Enter') return;
+const dropZone = $('dropZone');
+['dragenter', 'dragover'].forEach((t) => dropZone.addEventListener(t, (e) => {
   e.preventDefault();
-  const pid = $('ctxProject').value;
-  if (pid) paintFiles(await api(`/api/projects/${pid}/grep?q=${encodeURIComponent(e.target.value)}`));
-});
-
-function paintFiles(files) {
-  const box = $('ctxFiles');
-  box.replaceChildren();
-  updateCtxCount();
-  if (!files.length) { box.append(el('div', {class: 'muted'}, 'Nothing matched.')); return; }
-  files.slice(0, 400).forEach((f) => {
-    const cb = el('input', {type: 'checkbox', value: f});
-    cb.checked = ctxSelected.has(f);
-    // Track in a Set, not the DOM: filtering re-renders the list, and a file
-    // selected under an earlier filter must survive that.
-    cb.onchange = () => { cb.checked ? ctxSelected.add(f) : ctxSelected.delete(f); updateCtxCount(); };
-    box.append(el('label', {class: 'pick'}, cb, f));
-  });
-}
-
-function updateCtxCount() {
-  const n = ctxSelected.size;
-  $('ctxCount').textContent = n ? `${n} file${n > 1 ? 's' : ''} selected` : 'No files selected';
-}
-
-const saveContext = guard(async () => {
-  const pid = $('ctxProject').value;
-  await api(`/api/sessions/${sid}/context`, json('PUT', {files: [...ctxSelected]}));
-  // persist project choice on the session
-  await request(`/api/sessions/${sid}/project?pid=${pid || ''}`, {method: 'PUT'});
-  session = await api('/api/sessions/' + sid);
-  render();
-  $('ctxDlg').close();
-});
+  dropZone.classList.add('over');
+}));
+['dragleave', 'drop'].forEach((t) => dropZone.addEventListener(t, (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('over');
+}));
+dropZone.addEventListener('drop', (e) => uploadFiles(e.dataTransfer.files));
 
 /* ---------- start ---------- */
 (async () => {
@@ -507,7 +520,7 @@ const saveContext = guard(async () => {
     const h = await api('/api/health');
     modelName = h.model;
   } catch (e) { toast(e.message); }
-  projects = await api('/api/projects').catch(() => []);
   render();
   loadSessions();
+  loadProjects();
 })();

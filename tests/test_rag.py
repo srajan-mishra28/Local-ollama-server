@@ -35,6 +35,11 @@ def root(tmp_path):
     return r
 
 
+def index(store, pid, root, rels):
+    """Put files from a directory into the store (the fixtures write real files)."""
+    return [store.put_file(pid, r, (root / r).read_bytes()) for r in rels]
+
+
 def test_chunk_overlap_and_size():
     text = "".join(f"line {i:03d}\n" for i in range(100))
     chunks = rag.chunk_text(text, size=100, overlap=30)
@@ -71,8 +76,7 @@ def test_clean_relpath_normalises():
 
 
 def test_index_and_query(store, root):
-    stats = store.index_project(1, root, ["a.py", "b.py"])
-    assert stats["indexed"] == 2
+    assert index(store, 1, root, ["a.py", "b.py"]) == ["indexed", "indexed"]
     hits = store.query(1, "banana smoothie", k=2)
     assert hits[0]["path"] == "a.py"
     assert hits[0]["score"] > hits[1]["score"]
@@ -80,44 +84,22 @@ def test_index_and_query(store, root):
 
 
 def test_query_scoped_to_project(store, root):
-    store.index_project(1, root, ["a.py"])
+    index(store, 1, root, ["a.py"])
     assert store.query(2, "banana") == []
     assert not store.has_index(2)
 
 
-def test_reindex_unchanged_and_changed(store, root):
-    store.index_project(1, root, ["a.py"])
-    assert store.index_project(1, root, ["a.py"])["unchanged"] == 1
+def test_reupload_unchanged_and_changed(store, root):
+    assert index(store, 1, root, ["a.py"]) == ["indexed"]
+    assert index(store, 1, root, ["a.py"]) == ["unchanged"]
     (root / "a.py").write_text("def alpha():\n    return 'cherry pie'\n")
-    assert store.index_project(1, root, ["a.py"])["indexed"] == 1
+    assert index(store, 1, root, ["a.py"]) == ["indexed"]
     assert store.query(1, "cherry pie")[0]["text"].count("cherry") == 1
     assert all("banana" not in h["text"] for h in store.query(1, "banana"))  # no stale chunks
 
 
-def test_vanished_file_removed_on_reindex(store, root):
-    store.index_project(1, root, ["a.py", "b.py"])
-    (root / "b.py").unlink()
-    stats = store.index_project(1, root, ["a.py"])
-    assert stats["deleted"] == 1
-    assert [f["path"] for f in store.list_files(1)] == ["a.py"]
-    assert not (store.files_dir / "1" / "b.py").exists()
-
-
-def test_sync_file_update_and_delete(store, root):
-    assert store.sync_file(1, root, "a.py") == "indexed"
-    (root / "a.py").unlink()
-    assert store.sync_file(1, root, "a.py") == "deleted"
-    assert store.sync_file(1, root, "a.py") == "missing"
-    assert not store.has_index(1)
-
-
-def test_sync_file_rejects_escape(store, root):
-    with pytest.raises(ValueError):
-        store.sync_file(1, root, "../outside.py")
-
-
 def test_delete_file(store, root):
-    store.index_project(1, root, ["a.py", "b.py"])
+    index(store, 1, root, ["a.py", "b.py"])
     assert store.delete_file(1, "a.py") is True
     assert store.delete_file(1, "a.py") is False
     assert all(h["path"] == "b.py" for h in store.query(1, "banana", k=10))
@@ -132,15 +114,6 @@ def test_binary_replacing_text_drops_chunks(store):
     store.put_file(1, "x.txt", b"some text here")
     assert store.put_file(1, "x.txt", b"\x00binary") == "skipped"
     assert not store.has_index(1)
-
-
-def test_upload_survives_reindex_but_scan_does_not(store, root):
-    store.put_file(1, "notes.md", b"remember the milk", source="upload")
-    store.index_project(1, root, ["a.py"])
-    assert {f["path"] for f in store.list_files(1)} == {"notes.md", "a.py"}
-    # syncing an upload by path must not delete it just because it isn't in the folder
-    assert store.sync_file(1, root, "notes.md") == "missing"
-    assert store.has_index(1)
 
 
 def test_embedder_failure_keeps_old_chunks(tmp_path, root):
@@ -168,13 +141,13 @@ def test_model_change_triggers_reindex(tmp_path):
 
 
 def test_delete_project(store, root):
-    store.index_project(1, root, ["a.py"])
+    index(store, 1, root, ["a.py"])
     store.delete_project(1)
     assert not store.has_index(1) and not (store.files_dir / "1").exists()
 
 
 def test_query_blank_or_k_zero(store, root):
-    store.index_project(1, root, ["a.py"])
+    index(store, 1, root, ["a.py"])
     assert store.query(1, "  ") == []
     assert store.query(1, "banana", k=0) == []
 
