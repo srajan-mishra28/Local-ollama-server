@@ -8,7 +8,8 @@ from fastapi.concurrency import run_in_threadpool
 
 import rag
 from backend import rag_store
-from backend.config import EMBED_MODEL, MAX_UPLOAD_FILES, RAG_TOP_K, VISION_MODEL
+from backend.config import EMBED_MODEL, MAX_UPLOAD_FILES, RAG_TOP_K
+from backend.ollama_errors import describe_ollama_error
 from backend.routes.projects import require_project
 
 router = APIRouter()
@@ -18,19 +19,19 @@ MAX_NAME_LENGTH = 200  # also bounds the X-RAG-Sources response header
 
 def rag_call(fn, *args):
     """Run a store call: bad paths -> 400, stale index -> 409, Ollama failures -> 502."""
-    models = f"{EMBED_MODEL} / {VISION_MODEL}" if VISION_MODEL else EMBED_MODEL
     try:
         return fn(*args)
     except rag.ReindexRequired as e:
-        raise HTTPException(409, str(e))
+        raise HTTPException(409, f"{e}. Upload the project's files again to re-index them.")
     except rag.EmbeddingError as e:  # a ValueError, so must come before it
-        raise HTTPException(502, f"embedding failed (is {EMBED_MODEL} pulled?): {e}")
+        raise HTTPException(502, f"The embedding model '{EMBED_MODEL}' gave an unusable answer: {e}")
     except ValueError as e:
         raise HTTPException(400, str(e))
     except OSError as e:  # names valid here but illegal on this filesystem (`*`, `?`, too long)
         raise HTTPException(400, f"file name not usable on this server: {e}")
     except httpx.HTTPError as e:
-        raise HTTPException(502, f"Ollama request failed (is it running, are {models} pulled?): {e}")
+        # a 404 here is always the embedder: a missing vision model is a skipped image, not an error
+        raise HTTPException(502, describe_ollama_error(e, EMBED_MODEL, "embed"))
 
 
 def upload_name(filename: str | None) -> str:

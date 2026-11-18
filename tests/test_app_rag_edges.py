@@ -220,7 +220,7 @@ def test_chat_without_index_has_no_system_message(client, monkeypatch):
     pid = client.post("/api/projects", json={"name": "empty"}).json()["id"]
     sid = client.post(f"/api/projects/{pid}/sessions").json()["id"]
     r = client.post("/api/chat", json={"session_id": sid, "content": "banana"})
-    assert all(m["role"] != "system" for m in captured[0]["messages"])
+    assert all("<excerpts>" not in m["content"] for m in captured[0]["messages"])
     assert json.loads(r.headers["X-RAG-Sources"]) == []
 
 
@@ -233,7 +233,7 @@ def test_chat_falls_back_when_embedding_fails(chat_env, monkeypatch):
     monkeypatch.setattr(rag_store.store, "embedder", boom)
     r = client.post("/api/chat", json={"session_id": sid, "content": "banana"})
     assert r.status_code == 200 and r.text == "hi there"
-    assert all(m["role"] != "system" for m in captured[0]["messages"])
+    assert all("<excerpts>" not in m["content"] for m in captured[0]["messages"])
 
 
 def test_chat_without_project_skips_retrieval(client, monkeypatch):

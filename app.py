@@ -27,14 +27,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.database import init_db
-from backend.routes import chat, files, project_files, projects, sessions
+from backend.routes import chat, files, health, project_files, projects, sessions
 from backend.routes.chat import retrieve_context  # noqa: F401  (re-exported for tests)
 
 STATIC = Path(__file__).resolve().parent / "static"
 
 init_db()
 app = FastAPI(title="Local LLM server")
-for module in (sessions, projects, project_files, files, chat):
+for module in (sessions, projects, project_files, files, chat, health):
     app.include_router(module.router)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 

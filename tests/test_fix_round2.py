@@ -163,9 +163,9 @@ def test_toggle_nav_toggles_class_with_explicit_state():
     assert "document.body.classList.toggle('nav-open', open)" in _toggle_body()
 
 
-def test_ollama_down_heuristic_requires_no_output_and_known_error():
-    assert re.search(
-        r"!full\s*&&\s*\(\s*err\s+instanceof\s+TypeError\s*\|\|\s*err\.message\s*===\s*'Empty reply\.'\s*\)", JS)
+def test_failure_message_only_replaced_when_no_text_arrived():
+    # changed with the clean-errors work: a reply with text keeps it (partial); only an empty one is a failure
+    assert re.search(r"if \(full\.trim\(\)\) \{.*?\} else \{.*?failReply\(", JS, re.S)
 
 
 def test_side_and_menu_button_exist_in_html():

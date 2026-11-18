@@ -212,9 +212,12 @@ def test_session_delete_clears_state_only_after_request_succeeds():
     assert req < catch < body.index("return;", catch) < body.index("sid = null")
 
 
-def test_ollama_down_heuristic_matches_only_network_typeerror_or_empty_reply():
+def test_network_failure_message_is_chosen_only_for_a_network_typeerror():
+    # changed with the clean-errors work: the server now words Ollama failures (502 detail),
+    # so the UI only invents a message for a failed fetch (TypeError), never for an empty reply
     js = (STATIC / "app.js").read_text(encoding="utf-8")
-    assert re.search(r"err instanceof TypeError\s*\|\|\s*err\.message === 'Empty reply\.'", js)
+    assert re.search(r"err instanceof TypeError \? 'Cannot reach the server", js)
+    assert "Empty reply." not in js
     assert "/network|fetch" not in js
 
 
