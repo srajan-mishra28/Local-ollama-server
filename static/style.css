@@ -103,9 +103,12 @@ aside>*:not(.brand){margin:0 12px}
 .item.active .open{padding-left:1.5rem;padding-right:1.5rem;font-weight:var(--label-weight)}
 .item.active .open:focus-visible{outline:2px solid var(--accent-fg);outline-offset:-4px}
 .item.active .del:not(:disabled):hover{background:var(--accent-hover)}
-.item .del{opacity:0;padding:4px 8px;color:inherit;border-color:transparent}
-.item:hover .del,.item .del:focus-visible{opacity:1}
-@media(hover:none){.item .del{opacity:.7}}
+.item .del,.item .ren{opacity:0;padding:4px 8px;color:inherit;border-color:transparent}
+.item:hover .del,.item .del:focus-visible,.item:hover .ren,.item .ren:focus-visible,.item:focus-within .ren{opacity:1}
+.item.active .ren:not(:disabled):hover{background:var(--accent-hover)}
+@media(hover:none){.item .del,.item .ren{opacity:.7}}
+input.rename{flex:1;min-width:0;padding:5px 8px;font-size:14px}
+.item input.rename{margin:2px 0}
 .sec{display:flex;flex-direction:column;gap:6px;min-height:0}
 .sec.grow3{flex:3 1 0}.sec.grow2{flex:2 1 0}
 .sec-h{display:flex;align-items:center;justify-content:space-between;gap:8px}
@@ -125,6 +128,10 @@ header{height:3.4rem;flex-shrink:0;padding:0 1.25em;border-top:1px solid var(--l
 #projLink{max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block}
 .sources{align-self:flex-start;max-width:min(780px,92%);margin-top:-8px;padding:0 6px;font-size:12px;color:var(--muted);
   overflow-wrap:anywhere}
+
+/* shown when the server reports a problem (Ollama down, model missing); warn on the bar surface is AA in both themes */
+.health{padding:6px 1.25em;font-size:13px;background:var(--bar-bg);color:var(--warn);border-bottom:1px solid var(--line)}
+.msg.err button.retry{padding:3px 10px;font-size:.72rem;margin-left:6px;color:var(--ink)}
 
 #chatView{flex:1;display:flex;flex-direction:column;min-height:0}
 #log{flex:1;overflow-y:auto;padding:1.5rem 1.25em;display:flex;flex-direction:column;gap:14px;scroll-behavior:smooth}
@@ -156,7 +163,11 @@ header{height:3.4rem;flex-shrink:0;padding:0 1.25em;border-top:1px solid var(--l
 
 form.ask{display:flex;gap:8px;padding:12px 1.25em calc(12px + env(safe-area-inset-bottom));
   border-top:1px solid var(--line);background:var(--page);align-items:flex-end}
-form.ask textarea{resize:none;max-height:200px;line-height:1.4;flex:1}
+form.ask textarea{resize:none;max-height:200px;line-height:1.4}
+.ask-in{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.count{align-self:flex-end;font-size:12px;color:var(--muted)}
+.count.over{color:var(--err);font-weight:var(--label-weight)}
+textarea[aria-invalid=true]{border-color:var(--err)}
 
 /* dialogs */
 dialog{background:var(--page);color:var(--ink);border:1px solid var(--line);border-radius:var(--radius);
@@ -214,6 +225,7 @@ dialog::backdrop{background:var(--scrim)}
   #toasts{left:16px;right:16px;max-width:none}
 }
 @media(pointer:coarse){
-  button.icon,button.small,.item .del,.line button,.msg .code-h button{min-height:40px;min-width:40px}
+  button.icon,button.small,.item .del,.item .ren,.line button,.msg .code-h button,.msg.err button.retry,#stop{min-height:40px;min-width:40px}
+  input.rename{min-height:40px}
 }
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}

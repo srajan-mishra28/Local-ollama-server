@@ -188,14 +188,14 @@ def test_a_session_does_not_see_another_projects_files(client, ollama):
     upload(client, a, **{"secret.md": b"banana smoothie recipe"})
     sid = client.post(f"/api/projects/{b}/sessions").json()["id"]
     client.post("/api/chat", json={"session_id": sid, "content": "banana smoothie"})
-    assert system_text(ollama[0]) == ""
+    assert "<excerpts>" not in system_text(ollama[0])
 
 
 def test_files_uploaded_later_are_used_by_existing_sessions(client, ollama):
     pid = new_project(client)
     sid = client.post(f"/api/projects/{pid}/sessions").json()["id"]
     client.post("/api/chat", json={"session_id": sid, "content": "quantum entanglement"})
-    assert system_text(ollama[0]) == ""
+    assert "<excerpts>" not in system_text(ollama[0])
     upload(client, pid, **{"q.md": b"quantum entanglement notes"})
     client.post("/api/chat", json={"session_id": sid, "content": "quantum entanglement"})
     assert "quantum entanglement notes" in system_text(ollama[1])

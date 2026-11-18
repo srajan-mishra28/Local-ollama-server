@@ -21,30 +21,36 @@ function toast(msg, kind = 'error') {
   setTimeout(() => t.remove(), kind === 'error' ? 8000 : 4000);
 }
 
-// Readable explanations for the statuses a failed upload or chat can come back with.
+// Fallbacks for a failed response that carries no message of its own.
 const HINTS = {
-  413: 'Upload too large.',
-  409: 'The project index was built with another embedding model: upload the files again.',
-  502: 'Ollama did not answer properly. Is it running, and are the models pulled?',
+  413: 'Too large.',
+  502: 'Ollama did not answer properly.',
   400: 'Invalid request.',
 };
 
-// Turn a failed response into a readable message (FastAPI sends {"detail": ...}).
+// Turn a failed response into a readable message (FastAPI sends {"detail": ...},
+// and the server words it for people, so it is shown as is).
 async function errorText(r) {
   let detail = '';
   try {
     const j = await r.json();
     detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail || j);
   } catch (e) { /* not JSON */ }
-  const hint = HINTS[r.status];
-  return [hint, detail].filter(Boolean).join(' ') || `HTTP ${r.status}`;
+  return detail || HINTS[r.status] || `HTTP ${r.status}`;
+}
+
+// An Error carrying the HTTP status, so callers can tell a refused message from an outage.
+async function httpError(r) {
+  const e = new Error(await errorText(r));
+  e.status = r.status;
+  return e;
 }
 
 async function request(url, opts) {
   let r;
   try { r = await fetch(url, opts); }
   catch (e) { throw new Error('Cannot reach the server. Check the network connection.'); }
-  if (!r.ok) throw new Error(await errorText(r));
+  if (!r.ok) throw await httpError(r);
   return r;
 }
 const api = async (url, opts) => (await request(url, opts)).json();
@@ -168,6 +174,7 @@ const refreshLists = () => { loadSessions(); loadProjects(); refreshProject(); }
 /* ---------- chats ---------- */
 // Render a list of chat rows (normal chats in the sidebar, or a project's chats).
 function sessionList(box, rows, emptyText) {
+  if (box.querySelector('input.rename')) return;  // do not wipe a title being edited
   box.replaceChildren();
   if (!rows.length) box.append(el('div', {class: 'muted', style: 'padding:8px 10px'}, emptyText));
   rows.forEach((s) => {
@@ -183,10 +190,51 @@ function sessionList(box, rows, emptyText) {
     };
     const open = el('button', {class: 'open', type: 'button', onclick: () => openSession(s.id)}, s.title);
     if (s.id === sid) open.setAttribute('aria-current', 'true');
+    const ren = el('button', {class: 'icon ren', type: 'button', 'aria-label': 'Rename ' + s.title, title: 'Rename',
+      onclick: () => editTitle(open, s.title, (t) => renameSession(s, t), ren)}, '✎');
     box.appendChild(el('div', {class: 'item' + (s.id === sid ? ' active' : ''), oncontextmenu: (e) => { e.preventDefault(); del(); }},
-      open, el('button', {class: 'icon del danger', type: 'button', 'aria-label': 'Delete ' + s.title, title: 'Delete', onclick: del}, '✕')));
+      open, ren, el('button', {class: 'icon del danger', type: 'button', 'aria-label': 'Delete ' + s.title, title: 'Delete', onclick: del}, '✕')));
   });
 }
+
+// Swap a title for a text field: Enter saves, Escape cancels, leaving the field saves.
+// ``save(newTitle)`` does the work; focus returns to ``focusBack`` after a key press.
+function editTitle(target, current, save, focusBack) {
+  if (target.parentNode.querySelector('input.rename')) return;
+  const input = el('input', {class: 'rename', type: 'text', value: current, maxlength: '200', 'aria-label': 'Chat title'});
+  let done = false;
+  const finish = async (commit, byKey) => {
+    if (done) return;
+    done = true;
+    const next = input.value.trim();
+    input.remove();
+    target.hidden = false;
+    if (byKey && focusBack) focusBack.focus();
+    if (commit && next && next !== current) await save(next);
+    refreshLists();
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); finish(true, true); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false, true); }
+  });
+  input.addEventListener('blur', () => finish(true, false));
+  target.hidden = true;
+  target.after(input);
+  input.focus();
+  input.select();
+}
+
+async function renameSession(s, title) {
+  try {
+    const r = await api('/api/sessions/' + s.id, json('PUT', {title}));
+    if (session && session.id === s.id) { session.title = r.title; $('title').textContent = r.title; }
+  } catch (e) { toast(e.message); }
+}
+
+$('renameBtn').onclick = () => {
+  if (session) editTitle($('title'), session.title, (t) => renameSession(session, t), $('renameBtn'));
+};
+$('title').addEventListener('dblclick', () => $('renameBtn').click());
 
 const loadSessions = guard(async () => {
   sessionList($('sessions'), await api('/api/sessions'), 'No chats yet.');
@@ -212,6 +260,8 @@ function render() {
   showView('chat');
   log.replaceChildren($('empty'));
   $('title').textContent = session ? session.title : 'New chat';
+  $('title').title = session ? 'Double-click to rename' : '';
+  $('renameBtn').hidden = !session;
   $('sub').textContent = modelName;
   const inProject = !!(session && session.project_id);
   $('projLink').hidden = !inProject;
@@ -238,36 +288,66 @@ function bubble(cls, text) {
 }
 
 /* ---------- chat ---------- */
-q.addEventListener('input', () => {
+let maxChars = 20000;  // the server's message limit (replaced by /api/health)
+let abortCtl = null;   // aborts the reply being streamed (the Stop button)
+
+function resizeInput() {
   q.style.height = 'auto';
   q.style.height = Math.min(q.scrollHeight, 200) + 'px';
-});
+}
+
+// Live character counter, shown once the message is within 10% of the limit.
+function updateCount() {
+  const n = q.value.length, over = n > maxChars;
+  $('count').hidden = n < maxChars * 0.9;
+  $('count').textContent = `${n.toLocaleString()} / ${maxChars.toLocaleString()}` + (over ? ' (too long)' : '');
+  $('count').classList.toggle('over', over);
+  q.setAttribute('aria-invalid', over ? 'true' : 'false');
+}
+
+q.addEventListener('input', () => { resizeInput(); updateCount(); });
 q.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('ask').requestSubmit(); }
 });
 
-$('ask').onsubmit = async (e) => {
+function setBusy(on) {
+  busy = on;
+  $('send').hidden = on;
+  $('stop').hidden = !on;
+}
+
+$('ask').onsubmit = (e) => {
   e.preventDefault();
   const text = q.value.trim();
   if (!text || busy) return;
-  busy = true;
-  $('send').disabled = true;
+  if (text.length > maxChars) {
+    toast(`Message too long (${text.length} characters, max ${maxChars}). Shorten it to send.`);
+    return;
+  }
+  send(text, true);
+};
+
+// Send one message and stream the reply. ``fromInput``: the text came from the
+// input box, which is cleared once a chat exists to send it in.
+async function send(text, fromInput) {
+  if (busy) return;
+  setBusy(true);
   try {
     if (!sid) await newSession();
     if (!sid) return;
-    q.value = '';
-    q.style.height = 'auto';
-    bubble('user', text);
-    await stream(text);
+    if (fromInput) { q.value = ''; resizeInput(); updateCount(); }
+    log.querySelectorAll('button.retry').forEach((b) => b.remove());  // only the latest failure can be retried
+    await stream(text, bubble('user', text));
   } finally {
-    busy = false;
-    $('send').disabled = false;
+    setBusy(false);
     q.focus();
     refreshLists();
   }
-};
+}
 
-// The server names the project files it retrieved from in a response header.
+$('stop').onclick = () => { if (abortCtl) abortCtl.abort(); };
+
+// The server tells how it built the prompt in response headers.
 function sourcesFrom(res) {
   try {
     const v = JSON.parse(res.headers.get('X-RAG-Sources') || '[]');
@@ -275,24 +355,71 @@ function sourcesFrom(res) {
   } catch (e) { return []; }
 }
 
-function showSources(after, names) {
-  if (!names.length) return;
-  after.after(el('div', {class: 'sources', title: names.join(', ')}, 'Used project files: ' + names.join(', ')));
+function notesFrom(res) {
+  const sources = sourcesFrom(res);
+  return {
+    sources,
+    status: res.headers.get('X-RAG-Status') || (sources.length ? 'used' : ''),
+    trimmed: parseInt(res.headers.get('X-History-Trimmed') || '0', 10) || 0,
+  };
 }
 
-async function stream(text) {
+const RAG_NOTES = {
+  none: 'No project files matched this question',
+  empty: 'This project has no searchable files yet',
+  failed: 'Could not search project files',
+};
+
+// Small print under an answer: which project files it drew on, trimmed history, stopped.
+function showNotes(after, info, stopped) {
+  const lines = [];
+  if (info.status === 'used' && info.sources.length) lines.push('Used project files: ' + info.sources.join(', '));
+  else if (RAG_NOTES[info.status]) lines.push(RAG_NOTES[info.status]);
+  if (info.trimmed > 0) lines.push(`Earlier messages are not sent to the model (${info.trimmed})`);
+  if (stopped) lines.push('Stopped');
+  if (!lines.length) return;
+  after.after(el('div', {class: 'sources', title: lines.join('. ')}, ...lines.map((t) => el('div', {}, t))));
+}
+
+// Statuses where the server refused the message before storing anything.
+const REFUSED = [400, 404, 413];
+
+// No reply came. A refused message goes back into the input box (after any draft already there); otherwise the
+// failure is shown with Retry (the server dropped the unanswered question, so
+// resending does not duplicate it in the history).
+function failReply(out, mine, text, msg, refused) {
+  toast(msg);
+  if (refused) {
+    out.remove();
+    mine.remove();
+    // the box may already hold the next message: keep both rather than overwrite either
+    q.value = q.value.trim() ? q.value.replace(/\s+$/, '') + '\n\n' + text : text;
+    resizeInput(); updateCount();
+    return;
+  }
+  out.classList.add('err');
+  out.replaceChildren(msg + ' ', el('button', {class: 'ghost retry', type: 'button', onclick: () => {
+    out.remove();
+    mine.remove();
+    send(text, false);
+  }}, 'Retry'));
+}
+
+async function stream(text, mine) {
   const out = bubble('bot', '');
   out.innerHTML = '<span class="typing" role="status" aria-label="Assistant is typing"><i></i><i></i><i></i></span>';
-  let full = '', queued = false;
+  let full = '', queued = false, info = {sources: [], status: '', trimmed: 0};
   const paint = () => {
     queued = false;
     setBody(out, 'bot', full);
     log.scrollTop = log.scrollHeight;
   };
+  const ctl = new AbortController();
+  abortCtl = ctl;
   try {
-    const res = await fetch('/api/chat', json('POST', {session_id: sid, content: text}));
-    if (!res.ok) throw new Error(await errorText(res));
-    const sources = sourcesFrom(res);
+    const res = await fetch('/api/chat', {...json('POST', {session_id: sid, content: text}), signal: ctl.signal});
+    if (!res.ok) throw await httpError(res);
+    info = notesFrom(res);
     const reader = res.body.getReader(), dec = new TextDecoder();
     while (true) {
       const {done, value} = await reader.read();
@@ -301,13 +428,21 @@ async function stream(text) {
       if (!queued) { queued = true; requestAnimationFrame(paint); }
     }
     paint();
-    if (!full.trim()) throw new Error('Empty reply.');
-    showSources(out, sources);
+    if (!full.trim()) throw new Error('The model returned an empty reply.');
+    showNotes(out, info, false);
   } catch (err) {
-    const down = !full && (err instanceof TypeError || err.message === 'Empty reply.');
-    const msg = down ? 'No reply. Ollama may not be running (or the model is not pulled).' : err.message;
-    if (full) paint(); else { out.classList.add('err'); out.textContent = msg; }
-    toast(msg);
+    const stopped = err.name === 'AbortError';
+    if (full.trim()) {  // keep what arrived; the server stores the partial reply too
+      paint();
+      showNotes(out, info, stopped);
+      if (!stopped) toast(err.message);
+    } else {
+      const msg = stopped ? 'Stopped before any reply.'
+        : err instanceof TypeError ? 'Cannot reach the server. Check the network connection.' : err.message;
+      failReply(out, mine, text, msg, REFUSED.includes(err.status));
+    }
+  } finally {
+    abortCtl = null;
   }
 }
 
@@ -390,6 +525,8 @@ function paintProject() {
   const p = curProject;
   showView('project');
   $('title').textContent = p.name;
+  $('title').title = '';
+  $('renameBtn').hidden = true;
   $('sub').textContent = ['Project', plural(p.sessions.length, 'chat'), plural(p.files.length, 'file')].join(' \u00b7 ');
   $('projLink').hidden = true;
   $('projName').textContent = p.name;
@@ -457,8 +594,7 @@ const RESULT_TEXT = {
 // {tone, text} for one entry of the upload response ({path, result, status?, detail?}).
 function resultInfo(x) {
   if (x.result === 'error') {
-    const hint = x.status === 413 ? '' : HINTS[x.status];
-    return {tone: 'bad', text: [hint, x.detail].filter(Boolean).join(' ') || `Error ${x.status}`};
+    return {tone: 'bad', text: x.detail || HINTS[x.status] || `Error ${x.status}`};
   }
   return {tone: x.result.startsWith('skipped') ? 'warn' : 'ok', text: RESULT_TEXT[x.result] || x.result};
 }
@@ -515,12 +651,32 @@ const dropZone = $('dropZone');
 dropZone.addEventListener('drop', (e) => uploadFiles(e.dataTransfer.files));
 
 /* ---------- start ---------- */
-(async () => {
+// A small banner when Ollama or a needed model is missing; hidden when all is well.
+function healthProblem(h) {
+  if (!h) return 'Cannot reach the server.';
+  if (!h.ollama) return 'Ollama not reachable.';
+  if (h.models && !h.models.chat) return `Chat model ${h.model} not installed \u2014 run: ollama pull ${h.model}`;
+  if (h.models && !h.models.embed) return `Embedding model ${h.embed_model} not installed \u2014 run: ollama pull ${h.embed_model}`;
+  return '';
+}
+
+// Never throws: a failed health check must not break the page.
+async function checkHealth() {
+  let h = null;
   try {
-    const h = await api('/api/health');
-    modelName = h.model;
-  } catch (e) { toast(e.message); }
+    h = await api('/api/health');
+    modelName = h.model || modelName;
+    if (h.max_message_chars) { maxChars = h.max_message_chars; updateCount(); }
+  } catch (e) { h = null; }
+  const msg = healthProblem(h);
+  $('health').textContent = msg;
+  $('health').hidden = !msg;
+}
+
+(async () => {
+  await checkHealth();
   render();
   loadSessions();
   loadProjects();
+  setInterval(checkHealth, 30000);
 })();

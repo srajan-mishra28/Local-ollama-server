@@ -147,6 +147,7 @@ def test_js_uses_the_project_workspace_endpoints():
         ("DELETE", "/api/projects/{}"), ("POST", "/api/projects/{}/sessions"),
         ("POST", "/api/projects/{}/files"), ("DELETE", "/api/projects/{}/files"),
         ("GET", "/api/sessions"), ("POST", "/api/sessions"), ("POST", "/api/chat"),
+        ("PUT", "/api/sessions/{}"), ("GET", "/api/health"),
     ]:
         assert want in calls, want
 
@@ -187,3 +188,77 @@ def test_innerhtml_only_gets_escaped_markdown_or_a_fixed_literal():
 @pytest.mark.parametrize("name", ["index.html", "app.js", "style.css", "theme.js"])
 def test_static_files_are_valid_utf8(name):
     (ROOT / "static" / name).read_bytes().decode("utf-8")
+
+
+# ---- user-feedback fixes: stop, retry, rename, notes, health banner, counter ----------------
+
+def test_new_controls_exist_in_the_html():
+    for i in ("stop", "renameBtn", "health", "count"):
+        assert f'id="{i}"' in HTML, i
+    assert re.search(r'id="stop"[^>]*aria-label="[^"]+"', HTML) and re.search(r'id="renameBtn"[^>]*aria-label="[^"]+"', HTML)
+    assert re.search(r'id="health"[^>]*aria-live="polite"', HTML)
+
+
+def test_response_header_names_match_the_server():
+    from backend.routes.chat import STATUS_HEADER, TRIMMED_HEADER
+    assert f"'{STATUS_HEADER}'" in JS and f"'{TRIMMED_HEADER}'" in JS
+
+
+def test_every_rag_status_the_server_can_send_has_a_note_in_the_ui():
+    from backend.routes.chat import RAG_HINTS
+    for status in RAG_HINTS:  # none, empty, failed
+        assert re.search(rf"\b{status}:\s*'", JS), status
+    assert "'Used project files: '" in JS
+    assert "No project files matched this question" in JS and "Could not search project files" in JS
+    assert "Earlier messages are not sent to the model" in JS
+
+
+def test_stop_uses_an_abort_controller_on_the_chat_fetch():
+    assert "new AbortController()" in JS and "signal: ctl.signal" in JS and ".abort()" in JS
+    assert re.search(r"\$\('stop'\)\.onclick", JS) and "AbortError" in JS
+
+
+def test_retry_button_resends_the_same_text():
+    assert re.search(r"class: 'ghost retry'", JS) and re.search(r"send\(text, false\)", JS)
+
+
+def test_rename_has_button_enter_escape_and_double_click():
+    assert "json('PUT'" in JS and "'Rename ' + s.title" in JS
+    assert re.search(r"e\.key === 'Enter'.*?finish\(true", JS, re.S) and re.search(r"e\.key === 'Escape'.*?finish\(false", JS, re.S)
+    assert "addEventListener('dblclick'" in JS
+    assert "oncontextmenu" in JS  # the old shortcut still works, but delete and rename also have buttons
+    assert "'aria-label': 'Delete ' + s.title" in JS
+
+
+def test_rename_input_is_built_with_the_dom_api_not_innerhtml():
+    assert re.search(r"el\('input', \{class: 'rename'", JS)
+
+
+def test_health_is_polled_every_30_seconds_and_cannot_throw():
+    assert re.search(r"setInterval\(checkHealth,\s*30000\)", JS)
+    body = re.search(r"async function checkHealth\(\) \{(.*?)\n\}", JS, re.S).group(1)
+    assert "try {" in body and "catch" in body
+    for text in ("Ollama not reachable", "ollama pull"):
+        assert text in JS
+
+
+def test_counter_shows_near_the_limit_and_the_limit_comes_from_the_server():
+    assert "maxChars * 0.9" in JS and "max_message_chars" in JS
+    from backend.routes.health import router  # noqa: F401  (the field is part of /api/health)
+    assert "max_message_chars" in (ROOT / "backend" / "routes" / "health.py").read_text(encoding="utf-8")
+
+
+def test_error_text_shows_the_servers_detail_without_a_duplicate_prefix():
+    assert "Ollama did not answer properly. Is it running" not in JS
+    assert re.search(r"return detail \|\| HINTS\[r\.status\]", JS)
+
+
+def test_failed_message_is_put_back_in_the_input_when_refused():
+    assert "REFUSED" in JS and re.search(r": text;", JS)
+
+
+def test_refused_message_is_appended_to_a_draft_not_dropped():
+    """failReply must keep both the refused text and whatever is already in the box."""
+    body = JS[JS.index("function failReply"):]
+    body = body[:body.index("out.classList.add('err')")]
+    assert "q.value.trim() ?" in body and "'\\n\\n' + text" in body

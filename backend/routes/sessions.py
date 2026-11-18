@@ -1,5 +1,6 @@
 """Chat sessions. A session with no project is a normal chat; otherwise it belongs to one project."""
 
+import re
 import time
 
 from fastapi import APIRouter, HTTPException
@@ -10,9 +11,43 @@ from backend.database import db
 router = APIRouter()
 
 
+DEFAULT_TITLE = "New chat"  # a session still called this gets named after its first message
+TITLE_MAX = 200  # longest title a session can have
+AUTO_TITLE_MAX = 60  # length an automatic title is kept within
+_FIRST_SENTENCE = re.compile(r"(.+?[.!?])(?=\s|$)")
+
+
+def title_from_message(text: str) -> str:
+    """A short session title from its first message.
+
+    The first sentence if it is a reasonable length, else the start of the
+    message; anything longer than ``AUTO_TITLE_MAX`` is cut at a word boundary
+    and marked with an ellipsis, never mid-word. Never empty: punctuation-only
+    text ("........") is used as it is, and only a message with nothing printable
+    in it gets the default title.
+    """
+    text = " ".join(text.split())
+    if not any(ch.isprintable() and not ch.isspace() for ch in text):
+        return DEFAULT_TITLE
+    sentence = _FIRST_SENTENCE.match(text)
+    if sentence and len(sentence.group(1)) >= 8:
+        text = sentence.group(1).rstrip(".") or text
+    if len(text) <= AUTO_TITLE_MAX:
+        return text
+    room = AUTO_TITLE_MAX - 1  # one character for the ellipsis
+    cut = text[:room]
+    if not text[room].isspace() and " " in cut:  # the cut fell inside a word: drop it
+        cut = cut[:cut.rindex(" ")]
+    return (cut.rstrip(" ,;:-") or cut) + "\u2026"
+
+
 class NewSession(BaseModel):
-    title: str = "New chat"
+    title: str = DEFAULT_TITLE
     project_id: int | None = None
+
+
+class RenameSession(BaseModel):
+    title: str
 
 
 def insert_session(c, title: str, project_id: int | None) -> int:
@@ -44,6 +79,20 @@ def create_session(body: NewSession = NewSession()):
     """A normal chat, or a session inside a project when ``project_id`` is given."""
     with db() as c:
         return {"id": insert_session(c, body.title, body.project_id)}
+
+
+@router.put("/api/sessions/{sid}")
+def rename_session(sid: int, body: RenameSession):
+    """Set a chat's title (a normal chat or a project's); 1-200 characters after trimming."""
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(400, "title is required")
+    if len(title) > TITLE_MAX:
+        raise HTTPException(400, f"title is too long (max {TITLE_MAX} characters)")
+    with db() as c:
+        if not c.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, sid)).rowcount:
+            raise HTTPException(404, "no such session")
+    return {"id": sid, "title": title}
 
 
 @router.delete("/api/sessions/{sid}")

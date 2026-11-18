@@ -178,7 +178,7 @@ def test_sources_header_empty_list_for_project_without_hits(client, ollama):
     sid = client.post(f"/api/projects/{pid}/sessions").json()["id"]
     r = client.post("/api/chat", json={"session_id": sid, "content": "anything"})
     assert r.headers["X-RAG-Sources"] == "[]"
-    assert system_text(ollama[0]) == ""
+    assert "<excerpts>" not in system_text(ollama[0])
 
 
 def test_sources_header_empty_after_all_files_deleted(client, ollama):
@@ -187,7 +187,7 @@ def test_sources_header_empty_after_all_files_deleted(client, ollama):
     client.delete(f"/api/projects/{pid}/files", params={"path": "a.md"})
     sid = client.post(f"/api/projects/{pid}/sessions").json()["id"]
     r = client.post("/api/chat", json={"session_id": sid, "content": "banana smoothie"})
-    assert r.headers["X-RAG-Sources"] == "[]" and system_text(ollama[0]) == ""
+    assert r.headers["X-RAG-Sources"] == "[]" and "<excerpts>" not in system_text(ollama[0])
 
 
 # ---- chat resilience / validation --------------------------------------------------------
@@ -207,7 +207,7 @@ def test_chat_in_project_still_streams_when_retrieval_fails(client, ollama, monk
     r = client.post("/api/chat", json={"session_id": sid, "content": "banana smoothie"})
     assert r.status_code == 200 and r.text == "ok"
     assert r.headers["X-RAG-Sources"] == "[]"
-    assert system_text(ollama[0]) == ""
+    assert "<excerpts>" not in system_text(ollama[0])
     stored = client.get(f"/api/sessions/{sid}").json()["messages"]
     assert [x["role"] for x in stored] == ["user", "assistant"]
 
@@ -236,7 +236,7 @@ def test_chat_session_title_is_first_message_truncated(client, ollama):
     client.post("/api/chat", json={"session_id": sid, "content": "é" * 100})
     client.post("/api/chat", json={"session_id": sid, "content": "second"})
     titles = [s["title"] for s in client.get("/api/sessions").json()]
-    assert titles == ["é" * 60]
+    assert titles == ["é" * 59 + "…"]  # no space to cut at: hard cut plus ellipsis
 
 
 def test_chat_history_sent_to_model_has_no_stale_system_blocks(client, ollama):

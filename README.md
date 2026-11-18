@@ -1,6 +1,6 @@
 # Local Ollama Server
-<img width="1917" height="955" alt="image" src="https://github.com/user-attachments/assets/eb25aa07-cc10-47ba-86b9-f54a821b9fff" />
 
+<img width="1917" height="955" alt="image" src="https://github.com/user-attachments/assets/eb25aa07-cc10-47ba-86b9-f54a821b9fff" />
 
 A FastAPI gateway in front of a locally running [Ollama](https://ollama.com)
 model. It adds the things the raw Ollama API does not give you: persistent chat
@@ -60,11 +60,12 @@ older turns contained should live in the files.
   generated, and the full reply is persisted once the stream completes.
 - **Modern, mobile-friendly UI.** Served from `/`, no build step, no CDN (works
   offline on a LAN). Light and dark themes (follows the system, with a manual
-  toggle that is remembered; light = warm beige with Claude-terracotta accents,
-  dark = near-black, tokens in `static/style.css`; Netflix Sans is not bundled, so
-  dark mode uses a Helvetica-style fallback unless it is installed), markdown rendering with copyable code blocks,
+  toggle that is remembered), markdown rendering with copyable code blocks,
   auto-growing input (Enter sends, Shift+Enter adds a line), toasts for errors
-  such as Ollama being down, and a drawer sidebar on small screens.
+  such as Ollama being down, and a drawer sidebar on small screens. The theme is
+  light = warm beige with Claude-terracotta accents, dark = near-black, all as
+  tokens at the top of `static/style.css`; Netflix Sans is not bundled, so dark
+  mode uses a Helvetica-style fallback unless it is installed.
 
 ## Requirements
 
@@ -121,12 +122,14 @@ backend/
   database.py        SQLite connection helper, schema and in-place migration
   rag_store.py       the shared RagStore instance
   prompt.py          retrieval-query building and the chat history window
+  ollama_errors.py   Ollama failures worded for people
   routes/
     sessions.py      chats and project sessions (list, create, delete, load)
     projects.py      project workspaces: create, list, detail, delete, new session
     project_files.py project files: multi-file upload (auto-indexed), list, delete, /rag query
     files.py         file transfer to/from uploads/
-    chat.py          prompt assembly, streamed Ollama reply, /api/health
+    chat.py          prompt assembly, streamed Ollama reply
+    health.py        /api/health (Ollama reachability and installed models)
 static/
   index.html         the web UI markup
   style.css          UI styles
@@ -236,6 +239,10 @@ Edit the constants in `backend/config.py`:
 | `PDF_MAX_BYTES` | `20000000` | Largest PDF accepted |
 | `IMAGE_MAX_BYTES` | `10000000` | Largest image accepted |
 | `PDF_MAX_PAGES` | `300` | Pages read per PDF |
+| `MAX_MESSAGE_CHARS` | `20000` | Longest chat message accepted (413 beyond it) |
+| `CHAT_READ_TIMEOUT` | `300` | Seconds of silence from Ollama before a chat gives up |
+| `HEALTH_TIMEOUT` / `HEALTH_CACHE_SECONDS` | `2` / `5` | `/api/health` asks Ollama with this timeout and caches the answer this long |
+| `RAG_MIN_SCORE` | `0.5` | Minimum cosine similarity for an excerpt to be used (see below) |
 | `RAG_TOP_K` | `5` | Chunks retrieved per question |
 | `RAG_MAX_EXCERPT_CHARS` | `6000` | Total excerpt text injected per question |
 | `RAG_QUERY_HISTORY_CHARS` | `400` | Earlier user turns added to the retrieval query |
@@ -243,6 +250,12 @@ Edit the constants in `backend/config.py`:
 | `RAG_CHUNK_CHARS` / `RAG_OVERLAP_CHARS` | `1500` / `200` | Chunk size and overlap |
 | `MAX_UPLOAD_FILES` | `20` | Files accepted by one project upload request |
 | `PROJECT_NAME_MAX` | `100` | Longest project name |
+
+`RAG_MIN_SCORE` was chosen by measuring `nomic-embed-text` on short questions against
+short paragraphs: on-topic chunks scored 0.59-0.79, off-topic ones 0.25-0.44, and a code
+question against unrelated code 0.52. Longer chunks score lower, so if answers stop
+finding your files, check real scores with `GET /api/projects/{id}/rag?q=...` and lower it;
+re-measure if you change `EMBED_MODEL`.
 
 Keep `MAX_HISTORY_CHARS` plus `RAG_MAX_EXCERPT_CHARS` inside the context length
 configured in Ollama (roughly 3-4 characters per token), otherwise the prompt is
@@ -252,13 +265,14 @@ silently truncated by the model.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` | Liveness and active model |
+| `GET` | `/api/health` | `ok`, `model`, plus `status` (`ok`/`degraded`), `ollama` (reachable), `models` (`chat`, `embed`, `vision`: installed; `vision` is `null` when disabled), `max_message_chars`. Cached 5 s. A missing vision model does not degrade the status |
 | `GET` | `/api/sessions` | List normal chats (no project), newest first |
 | `POST` | `/api/sessions` | Create a chat; with `project_id` in the body, a session in that project |
 | `GET` | `/api/sessions/{id}` | Session with full message history, `project_id` and `project_name` |
+| `PUT` | `/api/sessions/{id}` | Rename: `{"title": ...}` (trimmed, 1-200 chars; 400 if blank, 404 if unknown); works inside projects |
 | `DELETE` | `/api/sessions/{id}` | Delete a session and its messages |
 | `GET` | `/api/projects` | List projects (`id`, `name`) |
-| `POST` | `/api/projects` | Create a project from `{"name": ...}` |
+| `POST` | `/api/projects` | Create a project from `{"name": ...}` (409 if the name exists, ignoring case and surrounding spaces) |
 | `GET` | `/api/projects/{id}` | The project with its `sessions` and `files` |
 | `DELETE` | `/api/projects/{id}` | Delete the project, its sessions, messages, files, chunks and copies |
 | `POST` | `/api/projects/{id}/sessions` | Create a session inside the project |
@@ -266,7 +280,7 @@ silently truncated by the model.
 | `GET` | `/api/projects/{id}/files` | Files with chunk counts |
 | `DELETE` | `/api/projects/{id}/files?path=` | Remove a file's chunks and local copy |
 | `GET` | `/api/projects/{id}/rag?q=&k=` | Query the project's index directly (debugging) |
-| `POST` | `/api/chat` | Send a message, stream the reply (`X-RAG-Sources` header) |
+| `POST` | `/api/chat` | Send a message, stream the reply. 400 if blank, 413 if over `MAX_MESSAGE_CHARS` (nothing is stored), 502 with a readable message if Ollama fails (the question is not kept). Headers: `X-RAG-Status` (`used`, `none`, `empty`, `failed`; absent in normal chats), `X-RAG-Sources` (files actually injected), `X-History-Trimmed` (older messages left out of the prompt, only when above 0) |
 | `POST` | `/api/upload` | Upload a file to `uploads/` (file transfer) |
 | `GET` | `/api/files` | List transferred files |
 | `GET` | `/api/files/{name}` | Download a transferred file |
@@ -307,7 +321,35 @@ Notes on behaviour:
   `/rag` answers 409; upload the files again to re-embed them. Chat keeps working,
   just without excerpts from those files.
 - If Ollama or the embedding model is unavailable, chat still works without
-  retrieved excerpts, and uploads report a 502 entry per file.
+  retrieved excerpts (reported as `failed`), and uploads report a 502 entry per file.
+  Errors are worded for people: "The embedding model 'X' isn't installed. Run:
+  ollama pull X", "Can't reach Ollama at <url>. Is it running?", "Ollama took too long
+  to answer".
+- A project chat that gets no excerpt scoring at least `RAG_MIN_SCORE` sends none, and
+  the model is told so in a short system hint (also for an empty project or a failed
+  search), so it can say the files don't cover the question. The UI shows under each
+  answer: "Used project files: ...", "No project files matched this question", "This
+  project has no searchable files yet" or "Could not search project files".
+- If the reply fails before any text arrives, the question is removed again, so a reload
+  does not show it unanswered and it is not sent as history; the UI offers Retry. Stop
+  keeps the partial reply (stored once) and closes the Ollama request. While waiting for
+  the first token (Ollama can be silent for a long time evaluating a prompt) the server
+  watches for the browser leaving: if it does, the Ollama request is closed and the
+  question removed, so Stop then Retry does not duplicate the exchange. The same cleanup
+  runs if the response is discarded before streaming starts.
+- If Ollama fails in the middle of a reply (error line, timeout, dropped connection), the
+  text so far is kept and ends with `[Reply interrupted: <reason>]`, both on screen and in
+  the stored message, so a cut-off answer is not mistaken for a complete one. A Stop by
+  the user adds no such marker. (A connection that closes cleanly but early, with no
+  error, cannot be told apart from a finished reply.)
+- A new chat is named after its first sentence (up to 60 characters, cut at a word
+  boundary with an ellipsis; a message of only punctuation uses that text) unless it was
+  renamed first. Rename with the pencil button,
+  the header button, or a double-click on the header title (Enter saves, Esc cancels).
+- File names are UTF-8 end to end. A name such as `hÃ©llo` in a Windows
+  console is the UTF-8 response read with the wrong codec, not a server problem.
+- The UI shows a banner when Ollama is unreachable or the chat/embedding model is not
+  installed (polled every 30 s), and a character counter near the message limit.
 
 ## Tests
 

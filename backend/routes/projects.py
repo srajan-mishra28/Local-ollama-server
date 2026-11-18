@@ -39,6 +39,9 @@ def create_project(body: NewProject):
     if len(name) > PROJECT_NAME_MAX:
         raise HTTPException(400, f"project name is too long (max {PROJECT_NAME_MAX} characters)")
     with db() as c:
+        taken = {r["name"].strip().casefold() for r in c.execute("SELECT name FROM projects")}
+        if name.casefold() in taken:
+            raise HTTPException(409, f"A project named '{name}' already exists")
         # path is a legacy column from when projects were disk folders
         cur = c.execute("INSERT INTO projects (name, path) VALUES (?, '')", (name,))
         return {"id": cur.lastrowid, "name": name}

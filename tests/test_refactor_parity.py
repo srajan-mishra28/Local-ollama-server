@@ -105,7 +105,8 @@ def test_static_missing_is_404(client):
 # ---------------------------------------------------------------- health
 
 def test_health_shape(client):
-    assert client.get("/api/health").json() == {"ok": True, "model": config.MODEL}
+    body = client.get("/api/health").json()
+    assert body["ok"] is True and body["model"] == config.MODEL  # fields older clients rely on
 
 
 # ---------------------------------------------------------------- sessions

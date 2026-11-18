@@ -47,8 +47,10 @@
       <div class="title" id="title">New chat</div>
       <div class="sub" id="sub"></div>
     </div>
+    <button class="icon" id="renameBtn" aria-label="Rename chat" title="Rename chat" hidden>&#9998;</button>
     <button class="ghost" id="projLink" hidden></button>
   </header>
+  <div class="health" id="health" role="status" aria-live="polite" hidden></div>
 
   <!-- project workspace -->
   <section id="projectView" aria-label="Project" hidden>
@@ -89,8 +91,12 @@
 
     <form class="ask" id="ask">
       <label for="q" class="sr">Message</label>
-      <textarea id="q" rows="1" placeholder="Ask something..." autocomplete="off" enterkeyhint="send"></textarea>
+      <div class="ask-in">
+        <textarea id="q" rows="1" placeholder="Ask something..." autocomplete="off" enterkeyhint="send"></textarea>
+        <div class="count" id="count" hidden></div>
+      </div>
       <button class="primary" id="send" aria-label="Send">Send</button>
+      <button class="ghost" id="stop" type="button" aria-label="Stop generating" hidden>Stop</button>
     </form>
   </section>
 </main>
