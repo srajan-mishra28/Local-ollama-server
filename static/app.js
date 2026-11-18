@@ -384,7 +384,7 @@ function showNotes(after, info, stopped) {
 // Statuses where the server refused the message before storing anything.
 const REFUSED = [400, 404, 413];
 
-// No reply came. A refused message goes back into the input box; otherwise the
+// No reply came. A refused message goes back into the input box (after any draft already there); otherwise the
 // failure is shown with Retry (the server dropped the unanswered question, so
 // resending does not duplicate it in the history).
 function failReply(out, mine, text, msg, refused) {
@@ -392,7 +392,9 @@ function failReply(out, mine, text, msg, refused) {
   if (refused) {
     out.remove();
     mine.remove();
-    if (!q.value.trim()) { q.value = text; resizeInput(); updateCount(); }
+    // the box may already hold the next message: keep both rather than overwrite either
+    q.value = q.value.trim() ? q.value.replace(/\s+$/, '') + '\n\n' + text : text;
+    resizeInput(); updateCount();
     return;
   }
   out.classList.add('err');

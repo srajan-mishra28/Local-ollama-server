@@ -505,6 +505,24 @@ def test_auto_title_never_empty_for_nonblank_message():
         assert title_from_message(m).strip() != "" or m.strip(" ,;:-") == ""
 
 
+@pytest.mark.parametrize("msg", ["........", "...", "?!?!?!?!", "-" * 100, "\u2026\u2026\u2026\u2026\u2026\u2026\u2026\u2026"])
+def test_auto_title_of_punctuation_only_message_falls_back_to_the_text(msg):
+    t = title_from_message(msg)
+    assert t.strip() and t != "New chat"
+    assert len(t) <= AUTO_TITLE_MAX
+
+
+@pytest.mark.parametrize("msg", ["\x00", "\x00\x01 \x02", "\u200b"])
+def test_auto_title_without_printable_characters_is_the_default(msg):
+    assert title_from_message(msg) == "New chat"
+
+
+def test_dotted_first_message_names_the_chat_through_the_api(client, ollama):
+    sid = new_chat(client)
+    assert ask(client, sid, "........").status_code == 200
+    assert client.get(f"/api/sessions/{sid}").json()["title"] == "........"
+
+
 def test_chat_with_newline_first_message_gets_one_line_title(client, ollama):
     sid = new_chat(client)
     ask(client, sid, "hello\nthere world, how are you doing today my friend, please answer at length")
@@ -637,9 +655,9 @@ def test_chat_error_line_after_some_text_keeps_partial_and_is_200(client, ollama
     ollama.lines = [piece("par"), json.dumps({"error": "died"})]
     sid = new_chat(client)
     r = ask(client, sid, "hi")
-    assert r.status_code == 200 and r.text == "par"
-    assert stored(sid) == [("user", "hi"), ("assistant", "par")]
-    assert "died" not in r.text
+    assert r.status_code == 200
+    assert r.text == "par\n\n[Reply interrupted: Ollama returned an error: died]"
+    assert stored(sid) == [("user", "hi"), ("assistant", r.text)]
 
 
 def test_malformed_json_lines_are_skipped(client, ollama):
@@ -876,7 +894,8 @@ def test_partial_text_means_no_deletion_even_if_stream_then_errors(client, ollam
     sid = new_chat(client)
     r = ask(client, sid, "q")
     assert r.status_code == 200
-    assert stored(sid) == [("user", "q"), ("assistant", "x")]
+    assert r.text.startswith("x\n\n[Reply interrupted: ")
+    assert stored(sid) == [("user", "q"), ("assistant", r.text)]
 
 
 def test_whitespace_only_first_piece_counts_as_text(client, ollama):
@@ -935,17 +954,86 @@ async def test_cancel_while_waiting_for_the_first_token_removes_the_question(cli
 # ---- disconnects ---------------------------------------------------------------------------------
 
 @pytest.mark.anyio
-async def test_known_gap_response_dropped_before_the_body_starts_keeps_the_question(client, ollama):
-    """KNOWN GAP (documented, not asserted as desired): chat() returns after the first piece is
-    fetched; if the client vanishes before Starlette ever starts the body iterator, stream()'s
-    finally never runs, so nothing closes the upstream and the question stays stored unanswered.
-    If this is ever fixed, flip the assertions."""
+async def test_response_dropped_before_the_body_starts_is_cleaned_up_by_the_background_task(client, ollama):
+    """chat() returns after the first piece; if the client vanishes before Starlette iterates the
+    body, the generator's finally never runs. The response's background task covers that."""
     ollama.endless = True
     sid = new_chat(client)
     resp, it = await open_stream(sid, "question")
     await it.aclose()  # never started: a no-op on an unstarted async generator
-    assert stored(sid) == [("user", "question")]
-    assert ollama.closed == 0  # upstream response left open until garbage collection
+    assert stored(sid) == [("user", "question")]  # not cleaned up yet ...
+    await resp.background()  # ... Starlette runs this after the body, or after a disconnect
+    assert stored(sid) == [("user", "question"), ("assistant", "ok")]  # the one piece it had, kept
+    assert ollama.closed == 1
+
+
+@pytest.mark.anyio
+async def test_reply_finish_is_idempotent_across_body_and_background(client, ollama):
+    ollama.lines = [piece("a"), piece("b")]
+    sid = new_chat(client)
+    resp, it = await open_stream(sid)
+    assert [p async for p in it] == ["a", "b"]
+    await resp.background()
+    await resp.background()
+    assert stored(sid) == [("user", "question"), ("assistant", "ab")]
+    assert ollama.closed == 1
+
+
+# ---- disconnect before the first token -----------------------------------------------------------
+
+class FakeRequest:
+    """Reports a disconnect after `after` polls."""
+
+    def __init__(self, after):
+        self.after = after
+        self.polls = 0
+
+    async def is_disconnected(self):
+        self.polls += 1
+        return self.polls > self.after
+
+
+@pytest.mark.anyio
+async def test_disconnect_before_the_first_token_drops_the_question_and_closes_upstream(client, ollama, monkeypatch):
+    monkeypatch.setattr(chat_routes, "DISCONNECT_POLL_SECONDS", 0.01)
+    ollama.hang = True
+    sid = new_chat(client)
+    resp = await chat_routes.chat(chat_routes.ChatIn(session_id=sid, content="question"), FakeRequest(after=3))
+    assert resp.status_code == 204
+    assert stored(sid) == []  # no orphaned question, no reply
+    assert ollama.closed == 1  # upstream request closed, so Ollama stops
+    assert resp.background is None and stored(sid) == [] and ollama.closed == 1
+
+
+@pytest.mark.anyio
+async def test_slow_first_token_without_disconnect_still_streams(client, ollama, monkeypatch):
+    monkeypatch.setattr(chat_routes, "DISCONNECT_POLL_SECONDS", 0.01)
+    ollama.first_delay = 0.2
+    ollama.lines = [piece("late"), piece(" reply")]
+    sid = new_chat(client)
+    req = FakeRequest(after=10**9)
+    resp, it = await _open(sid, req)
+    assert [p async for p in it] == ["late", " reply"]
+    assert req.polls > 1  # it did keep watching while waiting
+    assert stored(sid) == [("user", "question"), ("assistant", "late reply")]
+    assert ollama.closed == 1
+
+
+async def _open(sid, request):
+    resp = await chat_routes.chat(chat_routes.ChatIn(session_id=sid, content="question"), request)
+    return resp, resp.body_iterator
+
+
+@pytest.mark.anyio
+async def test_disconnect_before_first_token_leaves_history_alone(client, ollama, monkeypatch):
+    monkeypatch.setattr(chat_routes, "DISCONNECT_POLL_SECONDS", 0.01)
+    sid = new_chat(client)
+    assert ask(client, sid, "first").status_code == 200
+    before = stored(sid)
+    ollama.hang = True
+    resp = await chat_routes.chat(chat_routes.ChatIn(session_id=sid, content="second"), FakeRequest(after=1))
+    assert resp.status_code == 204
+    assert stored(sid) == before  # exactly the earlier exchange, the second question is gone
 
 
 @pytest.mark.anyio
@@ -1219,3 +1307,83 @@ def test_index_route_is_served_as_html_utf8(client):
 def test_static_files_are_served(client):
     for name in ("app.js", "style.css", "theme.js"):
         assert client.get(f"/static/{name}").status_code == 200
+
+
+# ---- retrieval is best-effort ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("exc", [FloatingPointError("overflow"), TypeError("bad operand"), RuntimeError("numpy"),
+                                 AttributeError("nope"), MemoryError()])
+def test_any_retrieval_exception_means_status_failed_and_chat_still_works(client, ollama, monkeypatch, exc):
+    pid = new_project(client, **{"a.md": b"banana smoothie"})
+
+    def boom(*a, **kw):
+        raise exc
+
+    monkeypatch.setattr(rag_store.store, "query", boom)
+    r = ask(client, new_chat(client, pid), "banana")
+    assert r.status_code == 200 and r.text == "ok"
+    assert r.headers["X-RAG-Status"] == "failed"
+    assert "Searching the project files failed" in system_text(ollama.requests[0])
+
+
+def test_corrupt_embedding_blob_means_status_failed(client, ollama):
+    pid = new_project(client, **{"a.md": b"banana smoothie"})
+    with sqlite3.connect(rag_store.store.db_path) as c:
+        c.execute("UPDATE rag_chunks SET embedding = 5")  # len(5) raises TypeError in the search
+    r = ask(client, new_chat(client, pid), "banana")
+    assert r.status_code == 200 and r.text == "ok"
+    assert r.headers["X-RAG-Status"] == "failed"
+
+
+@pytest.mark.anyio
+async def test_retrieval_does_not_swallow_base_exceptions(client, monkeypatch):
+    class Stop(BaseException):
+        pass
+
+    def stop(*a, **kw):
+        raise Stop
+
+    pid = new_project(client, **{"a.md": b"banana smoothie"})
+    monkeypatch.setattr(rag_store.store, "query", stop)
+    with pytest.raises(BaseException) as info:
+        await chat_routes.retrieve(pid, "banana")
+    assert not isinstance(info.value, Exception)
+    with pytest.raises(BaseException):  # cancellation is a BaseException too
+        async def cancelled(*a, **kw):
+            raise anyio.get_cancelled_exc_class()()
+        monkeypatch.setattr(chat_routes, "run_in_threadpool", cancelled)
+        await chat_routes.retrieve(pid, "banana")
+
+
+# ---- shielded upstream teardown / marker --------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_cancelling_the_reader_still_closes_the_upstream(client, ollama):
+    ollama.endless = True
+    gen = chat_routes.ollama_pieces([{"role": "user", "content": "x"}])
+    assert await anext(gen) == "ok"
+    await gen.aclose()
+    assert ollama.closed == 1
+
+
+def test_stop_does_not_add_an_interruption_marker(client, ollama):
+    """A client Stop closes the body generator; only an Ollama failure writes the marker."""
+    ollama.lines = [piece("a"), piece("b")]
+    sid = new_chat(client)
+    r = ask(client, sid, "hi")
+    assert "[Reply interrupted" not in r.text
+    assert stored(sid)[-1] == ("assistant", "ab")
+
+
+@pytest.mark.anyio
+async def test_interruption_marker_is_streamed_last_and_stored(client, ollama):
+    ollama.lines = [piece("par")]
+    ollama.mid_error = httpx.ReadTimeout("slow")
+    sid = new_chat(client)
+    resp, it = await open_stream(sid)
+    chunks = [p async for p in it]
+    assert chunks[0] == "par" and chunks[-1].startswith("\n\n[Reply interrupted: ")
+    assert "".join(chunks).count("[Reply interrupted") == 1
+    assert stored(sid)[-1] == ("assistant", "".join(chunks))
+    await resp.background()
+    assert len(stored(sid)) == 2

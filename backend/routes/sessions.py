@@ -22,19 +22,23 @@ def title_from_message(text: str) -> str:
 
     The first sentence if it is a reasonable length, else the start of the
     message; anything longer than ``AUTO_TITLE_MAX`` is cut at a word boundary
-    and marked with an ellipsis, never mid-word.
+    and marked with an ellipsis, never mid-word. Never empty: punctuation-only
+    text ("........") is used as it is, and only a message with nothing printable
+    in it gets the default title.
     """
     text = " ".join(text.split())
+    if not any(ch.isprintable() and not ch.isspace() for ch in text):
+        return DEFAULT_TITLE
     sentence = _FIRST_SENTENCE.match(text)
     if sentence and len(sentence.group(1)) >= 8:
-        text = sentence.group(1).rstrip(".")
+        text = sentence.group(1).rstrip(".") or text
     if len(text) <= AUTO_TITLE_MAX:
         return text
     room = AUTO_TITLE_MAX - 1  # one character for the ellipsis
     cut = text[:room]
     if not text[room].isspace() and " " in cut:  # the cut fell inside a word: drop it
         cut = cut[:cut.rindex(" ")]
-    return cut.rstrip(" ,;:-") + "\u2026"
+    return (cut.rstrip(" ,;:-") or cut) + "\u2026"
 
 
 class NewSession(BaseModel):

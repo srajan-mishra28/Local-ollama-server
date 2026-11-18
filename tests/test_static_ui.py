@@ -254,4 +254,11 @@ def test_error_text_shows_the_servers_detail_without_a_duplicate_prefix():
 
 
 def test_failed_message_is_put_back_in_the_input_when_refused():
-    assert "REFUSED" in JS and re.search(r"q\.value = text", JS)
+    assert "REFUSED" in JS and re.search(r": text;", JS)
+
+
+def test_refused_message_is_appended_to_a_draft_not_dropped():
+    """failReply must keep both the refused text and whatever is already in the box."""
+    body = JS[JS.index("function failReply"):]
+    body = body[:body.index("out.classList.add('err')")]
+    assert "q.value.trim() ?" in body and "'\\n\\n' + text" in body

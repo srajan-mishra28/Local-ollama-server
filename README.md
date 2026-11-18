@@ -1,5 +1,7 @@
 # Local Ollama Server
 
+<img width="1917" height="955" alt="image" src="https://github.com/user-attachments/assets/eb25aa07-cc10-47ba-86b9-f54a821b9fff" />
+
 A FastAPI gateway in front of a locally running [Ollama](https://ollama.com)
 model. It adds the things the raw Ollama API does not give you: persistent chat
 sessions, projects whose chats share uploaded files through a local RAG index,
@@ -60,7 +62,10 @@ older turns contained should live in the files.
   offline on a LAN). Light and dark themes (follows the system, with a manual
   toggle that is remembered), markdown rendering with copyable code blocks,
   auto-growing input (Enter sends, Shift+Enter adds a line), toasts for errors
-  such as Ollama being down, and a drawer sidebar on small screens.
+  such as Ollama being down, and a drawer sidebar on small screens. The theme is
+  light = warm beige with Claude-terracotta accents, dark = near-black, all as
+  tokens at the top of `static/style.css`; Netflix Sans is not bundled, so dark
+  mode uses a Helvetica-style fallback unless it is installed.
 
 ## Requirements
 
@@ -327,9 +332,19 @@ Notes on behaviour:
   project has no searchable files yet" or "Could not search project files".
 - If the reply fails before any text arrives, the question is removed again, so a reload
   does not show it unanswered and it is not sent as history; the UI offers Retry. Stop
-  keeps the partial reply (stored once) and closes the Ollama request.
+  keeps the partial reply (stored once) and closes the Ollama request. While waiting for
+  the first token (Ollama can be silent for a long time evaluating a prompt) the server
+  watches for the browser leaving: if it does, the Ollama request is closed and the
+  question removed, so Stop then Retry does not duplicate the exchange. The same cleanup
+  runs if the response is discarded before streaming starts.
+- If Ollama fails in the middle of a reply (error line, timeout, dropped connection), the
+  text so far is kept and ends with `[Reply interrupted: <reason>]`, both on screen and in
+  the stored message, so a cut-off answer is not mistaken for a complete one. A Stop by
+  the user adds no such marker. (A connection that closes cleanly but early, with no
+  error, cannot be told apart from a finished reply.)
 - A new chat is named after its first sentence (up to 60 characters, cut at a word
-  boundary with an ellipsis) unless it was renamed first. Rename with the pencil button,
+  boundary with an ellipsis; a message of only punctuation uses that text) unless it was
+  renamed first. Rename with the pencil button,
   the header button, or a double-click on the header title (Enter saves, Esc cancels).
 - File names are UTF-8 end to end. A name such as `hÃ©llo` in a Windows
   console is the UTF-8 response read with the wrong codec, not a server problem.

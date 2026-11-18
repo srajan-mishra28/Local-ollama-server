@@ -1,14 +1,15 @@
 """Chat: prompt assembly (project RAG excerpts + windowed history) and the streamed Ollama reply."""
 
+import contextlib
 import json
-import sqlite3
 import time
 
 import anyio
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 import rag
@@ -54,13 +55,21 @@ class OllamaStreamError(Exception):
     """Ollama sent an {"error": ...} line instead of a reply."""
 
 
+class ClientGone(Exception):
+    """The browser disconnected (Stop, closed tab) before the first reply text arrived."""
+
+
+DISCONNECT_POLL_SECONDS = 0.25  # how often to look for a vanished client while waiting for the first token
+
+
 async def retrieve(project_id: int | None, query: str) -> tuple[str | None, list[dict]]:
     """(status, hits): the excerpts for the prompt (best first, within the size budget).
 
     ``status`` is None for a normal chat, else 'used' (excerpts found), 'none'
     (indexed, but nothing scored >= RAG_MIN_SCORE), 'empty' (nothing indexed) or
     'failed'. Retrieval is best-effort: no failure here (embedder down, stale
-    index, database trouble) may break plain chat, it is reported as 'failed'.
+    index, corrupt data, database trouble) may break plain chat, it is reported
+    as 'failed'. Cancellation is not an Exception and still propagates.
     """
     if not project_id:
         return None, []
@@ -68,10 +77,10 @@ async def retrieve(project_id: int | None, query: str) -> tuple[str | None, list
         if not await run_in_threadpool(rag_store.store.has_index, project_id):
             return "empty", []
         hits = await run_in_threadpool(rag_store.store.query, project_id, query, RAG_TOP_K)
-    except (sqlite3.Error, OSError, httpx.HTTPError, ValueError, KeyError, rag.ReindexRequired):
+        relevant = [h for h in hits if h["score"] >= config.RAG_MIN_SCORE]
+        hits = rag.fit_hits(relevant, RAG_MAX_EXCERPT_CHARS)
+    except Exception:  # noqa: BLE001 - deliberately broad, see the docstring
         return "failed", []
-    relevant = [h for h in hits if h["score"] >= config.RAG_MIN_SCORE]
-    hits = rag.fit_hits(relevant, RAG_MAX_EXCERPT_CHARS)
     return ("used" if hits else "none"), hits
 
 
@@ -88,27 +97,42 @@ async def ollama_pieces(messages: list[dict]):
     """The reply's text pieces from Ollama, as they arrive.
 
     Closing this generator closes the upstream request, which stops generation.
+    The socket teardown is shielded so a cancellation cannot interrupt it.
     """
     timeout = httpx.Timeout(CHAT_READ_TIMEOUT, connect=5)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream(
-            "POST", f"{OLLAMA}/api/chat", json={"model": MODEL, "messages": messages, "stream": True}
-        ) as r:
+    async with contextlib.AsyncExitStack() as stack:
+        try:
+            client = await stack.enter_async_context(httpx.AsyncClient(timeout=timeout))
+            r = await stack.enter_async_context(client.stream(
+                "POST", f"{OLLAMA}/api/chat", json={"model": MODEL, "messages": messages, "stream": True}
+            ))
             if getattr(r, "status_code", 200) >= 400:
                 await r.aread()  # so the error body can be read for the message
                 r.raise_for_status()
             async for line in r.aiter_lines():
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(data, dict) and isinstance(data.get("error"), str):
-                    raise OllamaStreamError(data["error"][:200])
-                piece = data.get("message", {}).get("content", "")
+                piece = piece_from_line(line)
                 if piece:
                     yield piece
+        finally:
+            with anyio.CancelScope(shield=True):
+                await stack.aclose()
+
+
+def piece_from_line(line: str) -> str:
+    """The text in one line of Ollama's stream ('' for anything else); raises on an error line."""
+    if not line:
+        return ""
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    if isinstance(data.get("error"), str):
+        raise OllamaStreamError(data["error"][:200])
+    message = data.get("message")
+    piece = message.get("content") if isinstance(message, dict) else None
+    return piece if isinstance(piece, str) else ""
 
 
 def drop_message(message_id: int) -> None:
@@ -127,8 +151,80 @@ def save_reply(session_id: int, text: str) -> None:
         )
 
 
+class Reply:
+    """One chat turn's cleanup, owned here so it works whether or not the body ever streams.
+
+    ``finish`` is idempotent and is reached from the body generator's ``finally``
+    (normal end, Stop, cancellation), from the response's background task (runs
+    even when the body was never iterated) and from every failure path of
+    ``chat``. It closes the upstream request (stops Ollama generating), then keeps
+    the reply text if there is any, else takes the unanswered question back out.
+    """
+
+    def __init__(self, session_id: int, message_id: int):
+        self.session_id = session_id
+        self.message_id = message_id
+        self.pieces = None  # the ollama_pieces generator, once there is one
+        self.collected: list[str] = []
+        self.done = False
+
+    async def finish(self) -> None:
+        if self.done:
+            return
+        self.done = True
+        if self.pieces is not None:
+            with anyio.CancelScope(shield=True):
+                await self.pieces.aclose()
+        text = "".join(self.collected)
+        if text:
+            save_reply(self.session_id, text)
+        else:
+            drop_message(self.message_id)
+
+
+async def first_piece(pieces, request: Request | None):
+    """The reply's first piece (None if Ollama sent none).
+
+    Prompt evaluation can be silent for minutes, and the server is not told when
+    the browser gives up meanwhile, so the client is polled while waiting;
+    ClientGone if it left. Ollama's own errors propagate as they are.
+    """
+    if request is None:
+        return await anext(pieces, None)
+    outcome: list = []
+
+    async with anyio.create_task_group() as tg:
+        async def fetch():
+            try:
+                outcome.append((await anext(pieces, None), None))
+            except Exception as e:  # noqa: BLE001 - re-raised below, outside the task group
+                outcome.append((None, e))
+            tg.cancel_scope.cancel()
+
+        async def watch():
+            while not await request.is_disconnected():
+                await anyio.sleep(DISCONNECT_POLL_SECONDS)
+            tg.cancel_scope.cancel()
+
+        tg.start_soon(fetch)
+        tg.start_soon(watch)
+    if not outcome:
+        raise ClientGone
+    piece, error = outcome[0]
+    if error:
+        raise error
+    return piece
+
+
+def interruption_note(error: Exception) -> str:
+    """Visible marker for a reply that Ollama cut short (kept in the stored text too)."""
+    why = (f"Ollama returned an error: {error}" if isinstance(error, OllamaStreamError)
+           else describe_ollama_error(error, MODEL, "chat"))
+    return f"\n\n[Reply interrupted: {why}]"
+
+
 @router.post("/api/chat")
-async def chat(body: ChatIn):
+async def chat(body: ChatIn, request: Request = None):
     # checked before anything is stored; the API can be called without the UI's trimming
     if not body.content.strip():
         raise HTTPException(400, "Message is empty")
@@ -161,8 +257,9 @@ async def chat(body: ChatIn):
             )
 
     # From here until the first reply text arrives, any failure must take the
-    # stored question back out: an unanswered message would reappear on reload
-    # and be sent again as history.
+    # stored question back out (reply.finish does that when nothing was collected):
+    # an unanswered message would reappear on reload and be sent again as history.
+    reply = Reply(body.session_id, message_id)
     try:
         # Project knowledge comes from retrieval, not from the session's window.
         status, hits = await retrieve(s["project_id"], build_retrieval_query(history, body.content))
@@ -175,34 +272,39 @@ async def chat(body: ChatIn):
         window = fit_history(everything)
         messages.extend(window)
 
-        pieces = ollama_pieces(messages)
+        reply.pieces = ollama_pieces(messages)
         try:
-            first = await anext(pieces, None)
+            first = await first_piece(reply.pieces, request)
         except (httpx.HTTPError, OllamaStreamError) as e:
             detail = (f"Ollama returned an error: {e}" if isinstance(e, OllamaStreamError)
                       else describe_ollama_error(e, MODEL, "chat"))
             raise HTTPException(502, detail) from e
         if first is None:
             raise HTTPException(502, "The model returned an empty reply")
+    except ClientGone:
+        await reply.finish()
+        return Response(status_code=204)  # nobody is listening
     except BaseException:
-        drop_message(message_id)
+        with anyio.CancelScope(shield=True):
+            await reply.finish()
         raise
+    reply.collected.append(first)
 
     async def stream():
-        collected = [first]
         try:
             yield first
-            async for piece in pieces:
-                collected.append(piece)
-                yield piece
-        except (httpx.HTTPError, OllamaStreamError):
-            pass  # Ollama dropped mid-reply: keep what arrived
+            try:
+                async for piece in reply.pieces:
+                    reply.collected.append(piece)
+                    yield piece
+            except (httpx.HTTPError, OllamaStreamError) as e:
+                # Ollama dropped mid-reply: say so instead of passing off the text as complete
+                note = interruption_note(e)
+                reply.collected.append(note)
+                yield note
         finally:
-            # also runs when the client disconnects (Stop): close the upstream
-            # request so generation stops, then keep the partial reply
-            with anyio.CancelScope(shield=True):
-                await pieces.aclose()
-            save_reply(body.session_id, "".join(collected))
+            # also runs when the client disconnects (Stop)
+            await reply.finish()
 
     # json.dumps escapes non-ASCII, so the value is a valid header whatever the file names
     headers = {SOURCES_HEADER: json.dumps(list(dict.fromkeys(h["path"] for h in hits)))}
@@ -210,4 +312,6 @@ async def chat(body: ChatIn):
         headers[STATUS_HEADER] = status
     if len(everything) > len(window):
         headers[TRIMMED_HEADER] = str(len(everything) - len(window))
-    return StreamingResponse(stream(), media_type="text/plain", headers=headers)
+    return StreamingResponse(
+        stream(), media_type="text/plain", headers=headers, background=BackgroundTask(reply.finish)
+    )

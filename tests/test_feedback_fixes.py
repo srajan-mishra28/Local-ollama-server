@@ -41,6 +41,8 @@ class FakeUpstream:
         self.mid_error = None       # raised after the lines were delivered
         self.endless = False        # deliver "tick" pieces forever
         self.closed = 0             # how many responses were closed
+        self.hang = False           # connected, but silent (prompt evaluation): never delivers text
+        self.first_delay = 0        # seconds of silence before the first line
 
     def install(self, monkeypatch):
         upstream = self
@@ -59,6 +61,10 @@ class FakeUpstream:
                     upstream.status, json=upstream.error_body, request=req))
 
             async def aiter_lines(self):
+                if upstream.hang:
+                    await anyio.sleep(3600)
+                if upstream.first_delay:
+                    await anyio.sleep(upstream.first_delay)
                 for line in upstream.lines:
                     yield line
                 if upstream.endless:
@@ -566,8 +572,10 @@ def test_partial_reply_before_ollama_drops_is_kept(client, ollama):
     ollama.mid_error = httpx.ReadError("dropped")
     sid = new_chat(client)
     r = ask(client, sid, "q")
-    assert r.status_code == 200 and r.text == "part"
-    assert stored(sid) == [("user", "q"), ("assistant", "part")]
+    assert r.status_code == 200
+    # the cut is visible to the reader and to a later reload, not passed off as a complete reply
+    assert r.text.startswith("part\n\n[Reply interrupted: ")
+    assert stored(sid) == [("user", "q"), ("assistant", r.text)]
 
 
 def test_first_message_title_is_reapplied_on_retry(client, ollama):
